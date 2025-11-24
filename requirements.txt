@@ -24,3 +24,6 @@ pycaw>=20230407
 
 # Environment variables
 python-dotenv>=1.0.0
+
+# Process monitoring for diagnostic tools
+psutil>=5.9.0

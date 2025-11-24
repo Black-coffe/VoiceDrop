@@ -15,5 +15,8 @@ __pycache__/
 *.db
 settings.json
 
+# Log files
+*.log
+
 # Claude Code
 .claude/
