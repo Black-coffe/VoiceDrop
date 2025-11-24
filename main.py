@@ -59,8 +59,8 @@ class VoiceDropApp:
         self._is_recording = False
         self._lock = threading.Lock()
 
-        # Ensure audio is unmuted on startup (in case previous instance crashed)
-        self.audio_muter.unmute_all()
+        # Force unmute all audio on startup (in case previous instance crashed)
+        self.audio_muter.force_unmute_all()
 
         # Load saved settings and get hotkey VK codes
         self._saved_hotkey_vks = self._apply_saved_settings()
@@ -247,8 +247,8 @@ class VoiceDropApp:
         """Handle application quit"""
         print("[VoiceDrop] Shutting down...")
 
-        # Ensure audio is unmuted before exit
-        self.audio_muter.unmute_all()
+        # Force unmute all audio before exit
+        self.audio_muter.force_unmute_all()
 
         if self.hotkey_manager:
             self.hotkey_manager.stop()

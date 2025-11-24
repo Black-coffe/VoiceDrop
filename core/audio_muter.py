@@ -67,14 +67,12 @@ class AudioMuter:
     def unmute_all(self) -> bool:
         """
         Restore all audio sessions to their previous states
+        If no saved states exist, force unmute all sessions
 
         Returns:
             True if successful
         """
         with self._lock:
-            if not self._is_muted:
-                return True
-
             try:
                 sessions = self._get_audio_sessions()
                 restored_count = 0
@@ -82,13 +80,16 @@ class AudioMuter:
                 for session in sessions:
                     try:
                         pid = session.Process.pid
+                        volume = session._ctl.QueryInterface(ISimpleAudioVolume)
 
                         if pid in self._saved_states:
-                            volume = session._ctl.QueryInterface(ISimpleAudioVolume)
+                            # Restore saved state
                             saved_volume, was_muted = self._saved_states[pid]
-
-                            # Restore mute state
                             volume.SetMute(was_muted, None)
+                            restored_count += 1
+                        elif self._is_muted:
+                            # No saved state but we were muting - force unmute
+                            volume.SetMute(False, None)
                             restored_count += 1
 
                     except Exception:
@@ -103,6 +104,32 @@ class AudioMuter:
                 print(f"[AudioMuter] Error unmuting: {e}")
                 self._is_muted = False
                 return False
+
+    def force_unmute_all(self) -> bool:
+        """
+        Force unmute all audio sessions regardless of saved states
+        Used on startup to ensure audio is working
+
+        Returns:
+            True if successful
+        """
+        try:
+            sessions = self._get_audio_sessions()
+            unmuted_count = 0
+
+            for session in sessions:
+                try:
+                    volume = session._ctl.QueryInterface(ISimpleAudioVolume)
+                    volume.SetMute(False, None)
+                    unmuted_count += 1
+                except Exception:
+                    pass
+
+            print(f"[AudioMuter] Force unmuted {unmuted_count} audio sessions")
+            return True
+        except Exception as e:
+            print(f"[AudioMuter] Error force unmuting: {e}")
+            return False
 
     @property
     def is_muted(self) -> bool:
