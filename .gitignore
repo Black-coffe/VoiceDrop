@@ -1,0 +1,19 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment variables (API keys)
+.env
+
+# IDE
+.idea/
+
+# Local data
+*.db
+settings.json
+
+# Claude Code
+.claude/

@@ -1,0 +1,172 @@
+"""
+History Window - Shows recording history with copy functionality
+"""
+import os
+import tkinter as tk
+from datetime import datetime
+from typing import Callable, Optional
+
+import customtkinter as ctk
+
+from core.db_manager import DatabaseManager
+
+# Get icon path
+ICON_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'assets', 'icon.ico')
+
+
+class HistoryWindow(ctk.CTkToplevel):
+    def __init__(self, parent=None, on_copy_callback: Optional[Callable[[str], None]] = None):
+        super().__init__(parent)
+
+        self.on_copy_callback = on_copy_callback
+        self.db = DatabaseManager()
+
+        self.title("VoiceDrop - История записей")
+        self.geometry("600x400")
+        self.minsize(400, 300)
+
+        # Set window icon (need to wait for window to be created)
+        self.after(200, self._set_icon)
+
+        # Configure grid
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        # Create widgets
+        self._create_widgets()
+
+    def _set_icon(self):
+        """Set window icon"""
+        try:
+            if os.path.exists(ICON_PATH):
+                self.iconbitmap(ICON_PATH)
+        except Exception:
+            pass  # Ignore icon errors
+
+    def _create_widgets(self):
+        """Create window widgets"""
+        # Header
+        self.header_frame = ctk.CTkFrame(self)
+        self.header_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 5))
+        self.header_frame.grid_columnconfigure(0, weight=1)
+
+        self.title_label = ctk.CTkLabel(
+            self.header_frame,
+            text="История записей (последние 24 часа)",
+            font=ctk.CTkFont(size=16, weight="bold")
+        )
+        self.title_label.grid(row=0, column=0, sticky="w", padx=10, pady=10)
+
+        self.refresh_btn = ctk.CTkButton(
+            self.header_frame,
+            text="Обновить",
+            width=100,
+            command=self.refresh_list
+        )
+        self.refresh_btn.grid(row=0, column=1, padx=10, pady=10)
+
+        # Scrollable frame for recordings
+        self.scroll_frame = ctk.CTkScrollableFrame(self)
+        self.scroll_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(5, 10))
+        self.scroll_frame.grid_columnconfigure(0, weight=1)
+
+        # Status bar
+        self.status_label = ctk.CTkLabel(
+            self,
+            text="",
+            font=ctk.CTkFont(size=12)
+        )
+        self.status_label.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+
+        # Load recordings
+        self.refresh_list()
+
+        # Hide instead of destroy on close
+        self.protocol("WM_DELETE_WINDOW", self.hide)
+
+    def refresh_list(self):
+        """Refresh the recordings list"""
+        # Clear existing items
+        for widget in self.scroll_frame.winfo_children():
+            widget.destroy()
+
+        # Get recordings from database
+        recordings = self.db.get_recent_recordings(limit=100)
+
+        if not recordings:
+            no_data_label = ctk.CTkLabel(
+                self.scroll_frame,
+                text="Нет записей за последние 24 часа",
+                font=ctk.CTkFont(size=14)
+            )
+            no_data_label.grid(row=0, column=0, pady=50)
+            self.status_label.configure(text="0 записей")
+            return
+
+        # Add recording items
+        for i, recording in enumerate(recordings):
+            self._create_recording_item(i, recording)
+
+        self.status_label.configure(text=f"{len(recordings)} записей")
+
+    def _create_recording_item(self, index: int, recording: dict):
+        """Create a single recording item widget"""
+        frame = ctk.CTkFrame(self.scroll_frame)
+        frame.grid(row=index, column=0, sticky="ew", pady=2)
+        frame.grid_columnconfigure(1, weight=1)
+
+        # Time label
+        try:
+            created_at = datetime.fromisoformat(recording['created_at'])
+            time_str = created_at.strftime("%H:%M:%S")
+        except (ValueError, TypeError):
+            time_str = "??:??:??"
+
+        time_label = ctk.CTkLabel(
+            frame,
+            text=time_str,
+            font=ctk.CTkFont(size=11),
+            width=70
+        )
+        time_label.grid(row=0, column=0, padx=(10, 5), pady=8)
+
+        # Text label (truncated if too long)
+        text = recording.get('text', '')
+        display_text = text[:100] + "..." if len(text) > 100 else text
+
+        text_label = ctk.CTkLabel(
+            frame,
+            text=display_text,
+            font=ctk.CTkFont(size=12),
+            anchor="w",
+            justify="left"
+        )
+        text_label.grid(row=0, column=1, sticky="ew", padx=5, pady=8)
+
+        # Copy button
+        copy_btn = ctk.CTkButton(
+            frame,
+            text="Копировать",
+            width=90,
+            height=28,
+            command=lambda t=text: self._copy_text(t)
+        )
+        copy_btn.grid(row=0, column=2, padx=10, pady=8)
+
+    def _copy_text(self, text: str):
+        """Copy text to clipboard"""
+        if self.on_copy_callback:
+            self.on_copy_callback(text)
+        self.status_label.configure(text="Скопировано в буфер обмена!")
+        self.after(2000, lambda: self.status_label.configure(text=""))
+
+    def show(self):
+        """Show the window"""
+        self.refresh_list()
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def hide(self):
+        """Hide the window"""
+        self.withdraw()

@@ -1,0 +1,26 @@
+# Audio recording
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.24.0
+
+# Global hotkeys and keyboard simulation
+pynput>=1.7.6
+pyperclip>=1.8.2
+
+# HTTP client for ElevenLabs API
+httpx>=0.25.0
+
+# GUI - System tray and windows
+pystray>=0.19.5
+Pillow>=10.0.0
+customtkinter>=5.2.0
+
+# Database
+apscheduler>=3.10.4
+
+# Windows-specific
+pywin32>=306
+pycaw>=20230407
+
+# Environment variables
+python-dotenv>=1.0.0
