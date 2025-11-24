@@ -22,8 +22,8 @@ class HistoryWindow(ctk.CTkToplevel):
         self.db = DatabaseManager()
 
         self.title("VoiceDrop - История записей")
-        self.geometry("600x400")
-        self.minsize(400, 300)
+        self.geometry("800x600")
+        self.minsize(500, 400)
 
         # Set window icon (need to wait for window to be created)
         self.after(200, self._set_icon)
@@ -111,8 +111,10 @@ class HistoryWindow(ctk.CTkToplevel):
 
     def _create_recording_item(self, index: int, recording: dict):
         """Create a single recording item widget"""
+        is_latest = (index == 0)  # First item is the latest recording
+
         frame = ctk.CTkFrame(self.scroll_frame)
-        frame.grid(row=index, column=0, sticky="ew", pady=2)
+        frame.grid(row=index, column=0, sticky="ew", pady=(5 if is_latest else 2))
         frame.grid_columnconfigure(1, weight=1)
 
         # Time label
@@ -128,20 +130,27 @@ class HistoryWindow(ctk.CTkToplevel):
             font=ctk.CTkFont(size=11),
             width=70
         )
-        time_label.grid(row=0, column=0, padx=(10, 5), pady=8)
+        time_label.grid(row=0, column=0, padx=(10, 5), pady=8, sticky="n" if is_latest else "")
 
-        # Text label (truncated if too long)
+        # Text label - show more text for latest recording
         text = recording.get('text', '')
-        display_text = text[:100] + "..." if len(text) > 100 else text
+        if is_latest:
+            # Latest recording: show up to 400 chars, multi-line
+            max_chars = 400
+            display_text = text[:max_chars] + "..." if len(text) > max_chars else text
+        else:
+            # Other recordings: truncate to 100 chars
+            display_text = text[:100] + "..." if len(text) > 100 else text
 
         text_label = ctk.CTkLabel(
             frame,
             text=display_text,
             font=ctk.CTkFont(size=12),
             anchor="w",
-            justify="left"
+            justify="left",
+            wraplength=550 if is_latest else 0  # Enable wrapping for latest
         )
-        text_label.grid(row=0, column=1, sticky="ew", padx=5, pady=8)
+        text_label.grid(row=0, column=1, sticky="ew", padx=5, pady=(10 if is_latest else 8))
 
         # Copy button
         copy_btn = ctk.CTkButton(
@@ -151,7 +160,7 @@ class HistoryWindow(ctk.CTkToplevel):
             height=28,
             command=lambda t=text: self._copy_text(t)
         )
-        copy_btn.grid(row=0, column=2, padx=10, pady=8)
+        copy_btn.grid(row=0, column=2, padx=10, pady=8, sticky="n" if is_latest else "")
 
     def _copy_text(self, text: str):
         """Copy text to clipboard"""
