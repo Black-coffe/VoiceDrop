@@ -14,8 +14,16 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-    # Set AppUserModelID for proper taskbar icon on Windows
     import ctypes
+
+    # Single instance check using Windows mutex
+    MUTEX_NAME = "VoiceDrop_SingleInstance_Mutex"
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        print("[VoiceDrop] Already running, exiting...")
+        sys.exit(0)
+
+    # Set AppUserModelID for proper taskbar icon on Windows
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('VoiceDrop.App')
 
 import customtkinter as ctk
