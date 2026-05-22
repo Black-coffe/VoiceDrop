@@ -108,7 +108,7 @@ if sys.platform == 'win32':
 import customtkinter as ctk
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from config import ELEVENLABS_API_KEY, HISTORY_RETENTION_HOURS
+from config import ELEVENLABS_API_KEY, HISTORY_RETENTION_HOURS, APP_VERSION
 from core import autostart
 from core.audio_muter import AudioMuter
 from core.audio_recorder import AudioRecorder
@@ -673,6 +673,21 @@ class VoiceDropApp:
         if self.tray_icon:
             self.tray_icon.show_notification("VoiceDrop — расход ElevenLabs", msg)
 
+    def _get_pending_count(self) -> int:
+        """Number of recordings waiting in the offline resend queue."""
+        try:
+            return self.pending_queue.count()
+        except Exception:
+            return 0
+
+    def _flush_pending(self):
+        """Force an immediate attempt to resend the pending queue (tray action)."""
+        if self._get_pending_count() == 0:
+            if self.tray_icon:
+                self.tray_icon.show_notification("VoiceDrop — очередь", "Очередь пуста")
+            return
+        threading.Thread(target=self._process_pending_queue, daemon=True).start()
+
     def _retranscribe_last(self, language: str):
         """Re-transcribe the last recording with a forced language (RU/UK/EN bleed fix)."""
         audio = self._last_audio_data
@@ -872,7 +887,10 @@ class VoiceDropApp:
             on_toggle_autostart=self._toggle_autostart,
             get_autostart=self._get_autostart,
             on_toggle_save_history=self._toggle_save_history,
-            get_save_history=self._get_save_history
+            get_save_history=self._get_save_history,
+            get_pending_count=self._get_pending_count,
+            on_flush_pending=self._flush_pending,
+            app_version=APP_VERSION
         )
 
         # Run tray icon in separate thread (it blocks)

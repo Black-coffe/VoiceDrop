@@ -76,6 +76,9 @@ class TrayIcon:
         get_autostart: Optional[Callable[[], bool]] = None,
         on_toggle_save_history: Optional[Callable[[], None]] = None,
         get_save_history: Optional[Callable[[], bool]] = None,
+        get_pending_count: Optional[Callable[[], int]] = None,
+        on_flush_pending: Optional[Callable[[], None]] = None,
+        app_version: str = "",
     ):
         self.on_show_history = on_show_history
         self.on_quit = on_quit
@@ -95,6 +98,9 @@ class TrayIcon:
         self.get_autostart = get_autostart
         self.on_toggle_save_history = on_toggle_save_history
         self.get_save_history = get_save_history
+        self.get_pending_count = get_pending_count
+        self.on_flush_pending = on_flush_pending
+        self.app_version = app_version
 
         self._icon: Optional[pystray.Icon] = None
         self._icon_normal = create_icon_image("#4CAF50")  # Green
@@ -159,11 +165,17 @@ class TrayIcon:
             ),
             Item("Расход ElevenLabs", lambda icon, item: self._handle_show_usage()),
             Item(
+                self._pending_text,
+                lambda icon, item: self._handle_flush_pending(),
+                enabled=lambda item: self._pending_count() > 0,
+            ),
+            Item(
                 "Сохранять историю",
                 lambda icon, item: self._handle_toggle_save_history(),
                 checked=lambda item: self._current_save_history(),
             ),
             Item("Настройки", self._on_settings),
+            Item(f"VoiceDrop {self.app_version}", lambda icon, item: None, enabled=False),
             pystray.Menu.SEPARATOR,
             Item("Выход", self._on_quit)
         )
@@ -224,6 +236,22 @@ class TrayIcon:
     def _handle_show_usage(self):
         if self.on_show_usage:
             threading.Thread(target=self.on_show_usage, daemon=True).start()
+
+    def _pending_count(self) -> int:
+        if self.get_pending_count:
+            try:
+                return int(self.get_pending_count())
+            except Exception:
+                return 0
+        return 0
+
+    def _pending_text(self, item) -> str:
+        n = self._pending_count()
+        return f"Очередь: {n} — дослать" if n > 0 else "Очередь пуста"
+
+    def _handle_flush_pending(self):
+        if self.on_flush_pending:
+            threading.Thread(target=self.on_flush_pending, daemon=True).start()
 
     def _current_save_history(self) -> bool:
         if self.get_save_history:

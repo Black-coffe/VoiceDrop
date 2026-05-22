@@ -45,4 +45,5 @@ ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 
 # Application settings
 APP_NAME = "VoiceDrop"
+APP_VERSION = "1.0.0"
 TRAY_TOOLTIP = "VoiceDrop - Voice to Text (Ctrl+Shift+Space)"
