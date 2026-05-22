@@ -67,6 +67,7 @@ class TrayIcon:
         get_polish_enabled: Optional[Callable[[], bool]] = None,
         on_set_mode: Optional[Callable[[str], None]] = None,
         get_mode: Optional[Callable[[], str]] = None,
+        on_retranscribe: Optional[Callable[[str], None]] = None,
     ):
         self.on_show_history = on_show_history
         self.on_quit = on_quit
@@ -77,6 +78,7 @@ class TrayIcon:
         self.get_polish_enabled = get_polish_enabled
         self.on_set_mode = on_set_mode
         self.get_mode = get_mode
+        self.on_retranscribe = on_retranscribe
 
         self._icon: Optional[pystray.Icon] = None
         self._icon_normal = create_icon_image("#4CAF50")  # Green
@@ -112,6 +114,11 @@ class TrayIcon:
             )),
             Item("Язык", pystray.Menu(
                 *[self._lang_item(label, code) for label, code in self.LANGUAGE_OPTIONS]
+            )),
+            Item("Переписать последнее", pystray.Menu(
+                Item("Русский", lambda icon, item: self._handle_retranscribe("ru")),
+                Item("Українська", lambda icon, item: self._handle_retranscribe("uk")),
+                Item("English", lambda icon, item: self._handle_retranscribe("en")),
             )),
             Item(
                 "Полировка текста (LLM)",
@@ -166,6 +173,11 @@ class TrayIcon:
     def _handle_set_mode(self, value: str):
         if self.on_set_mode:
             threading.Thread(target=self.on_set_mode, args=(value,), daemon=True).start()
+
+    def _handle_retranscribe(self, language: str):
+        """Re-transcribe the last recording in a forced language (off the tray thread)."""
+        if self.on_retranscribe:
+            threading.Thread(target=self.on_retranscribe, args=(language,), daemon=True).start()
 
     def _current_polish(self) -> bool:
         """Whether LLM polish is currently enabled (for the menu checkmark)."""

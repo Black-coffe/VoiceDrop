@@ -62,6 +62,7 @@ class ElevenLabsClient:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or ELEVENLABS_API_KEY
         self._client: Optional[httpx.Client] = None
+        self.last_language_code: Optional[str] = None  # language scribe detected last
 
     def _get_client(self) -> httpx.Client:
         """Get or create HTTP client with connection pooling"""
@@ -128,7 +129,14 @@ class ElevenLabsClient:
                 logging.warning(f"HTTP error, attempt {attempt + 1}: {e}")
             else:
                 if response.status_code == 200:
-                    return _strip_audio_events(response.json().get("text", ""))
+                    result = response.json()
+                    lang = result.get("language_code")
+                    if lang:
+                        self.last_language_code = lang
+                        prob = result.get("language_probability")
+                        suffix = f" (p={prob:.2f})" if isinstance(prob, (int, float)) else ""
+                        logging.info(f"STT detected language: {lang}{suffix}")
+                    return _strip_audio_events(result.get("text", ""))
 
                 is_retryable_status = response.status_code in _RETRY_STATUS
 

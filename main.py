@@ -163,6 +163,10 @@ class VoiceDropApp:
         # recording already ended and undo itself, preventing "stuck muted" audio.
         self._record_session_id = 0
         self._last_start_beep = 0.0
+        # Last recording's audio, kept so it can be re-transcribed in another
+        # language (one-click fix for RU/UK/EN auto-detect bleed).
+        self._last_audio_data: Optional[bytes] = None
+        self._last_duration_ms = 0
 
         # Force unmute all audio on startup (in case previous instance crashed)
         logging.info("Force unmuting all audio on startup...")
@@ -332,6 +336,9 @@ class VoiceDropApp:
 
     def _process_audio(self, audio_data: bytes, duration_ms: int):
         """Process audio: transcribe and insert text"""
+        # Keep this clip so it can be re-transcribed in another language later.
+        self._last_audio_data = audio_data
+        self._last_duration_ms = duration_ms
         try:
             # Transcribe
             logging.info("Sending to ElevenLabs...")
@@ -565,6 +572,48 @@ class VoiceDropApp:
         if self.tray_icon:
             self.tray_icon.show_notification("VoiceDrop — режим", f"Режим: {names.get(mode, mode)}")
 
+    def _retranscribe_last(self, language: str):
+        """Re-transcribe the last recording with a forced language (RU/UK/EN bleed fix)."""
+        audio = self._last_audio_data
+        if not audio:
+            if self.tray_icon:
+                self.tray_icon.show_notification("VoiceDrop", "Нет последней записи для переписывания")
+            return
+        threading.Thread(
+            target=self._do_retranscribe, args=(audio, self._last_duration_ms, language),
+            daemon=True
+        ).start()
+
+    def _do_retranscribe(self, audio: bytes, duration_ms: int, language: str):
+        names = {'ru': 'RU', 'uk': 'UK', 'en': 'EN'}
+        try:
+            logging.info(f"Re-transcribing last recording, forced language={language}")
+            text = self.elevenlabs_client.transcribe(audio, language=language)
+            text = (text or "").strip()
+            if not text:
+                if self.tray_icon:
+                    self.tray_icon.show_notification("VoiceDrop", "Переписывание дало пустой текст")
+                return
+            # Deterministic passes only (dictionary + commands); language is forced.
+            text = self.text_replacer.apply(text)
+            text = self.voice_commands.apply(text)
+            self.text_inserter.copy_to_clipboard(text)
+            self.db.save_recording(text, duration_ms, was_inserted=False)
+            winsound.Beep(800, 100)
+            logging.info(f"Re-transcribed ({language}): {text[:50]}")
+            if self.tray_icon:
+                preview = text[:60] + ('…' if len(text) > 60 else '')
+                self.tray_icon.show_notification(
+                    f"VoiceDrop — переписано ({names.get(language, language)})",
+                    f"{preview}\n(в буфере — вставьте Ctrl+V)"
+                )
+        except TranscriptionError as e:
+            logging.error(f"Re-transcribe failed: {e}")
+            if self.tray_icon:
+                self.tray_icon.show_notification("VoiceDrop — ошибка", str(e))
+        except Exception as e:
+            logging.error(f"Re-transcribe error: {e}", exc_info=True)
+
     def _show_history(self):
         """Show history window"""
         if self._root:
@@ -709,7 +758,8 @@ class VoiceDropApp:
             on_toggle_polish=self._toggle_polish,
             get_polish_enabled=self._get_polish_enabled,
             on_set_mode=self._set_mode,
-            get_mode=self._get_mode
+            get_mode=self._get_mode,
+            on_retranscribe=self._retranscribe_last
         )
 
         # Run tray icon in separate thread (it blocks)
