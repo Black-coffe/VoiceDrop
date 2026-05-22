@@ -144,6 +144,7 @@ class VoiceDropApp:
         self.audio_recorder = AudioRecorder()
         self.audio_muter = AudioMuter()
         self.elevenlabs_client = ElevenLabsClient()
+        self._apply_network_settings()
         self.text_inserter = TextInserter()
         self.db = DatabaseManager()
         self.db.set_retention(load_settings().get('history_retention_hours', HISTORY_RETENTION_HOURS))
@@ -326,7 +327,8 @@ class VoiceDropApp:
                     self._root.after(0, self.recording_overlay.hide)
                 return
 
-            if not audio_data or duration_ms < 200:  # Too short
+            min_ms = load_settings().get('min_duration_ms', 200)
+            if not audio_data or duration_ms < min_ms:  # Too short
                 logging.info("Recording too short, ignoring")
                 if self.recording_overlay and self._root:
                     self._root.after(0, self.recording_overlay.hide)
@@ -553,6 +555,9 @@ class VoiceDropApp:
         # Apply history retention
         self.db.set_retention(settings.get('history_retention_hours', HISTORY_RETENTION_HOURS))
 
+        # Apply network settings (retries, timeout)
+        self._apply_network_settings()
+
     def _get_language(self) -> Optional[str]:
         """Current language code from settings (None = auto). Used by the tray menu."""
         return load_settings().get('language_code')
@@ -600,6 +605,14 @@ class VoiceDropApp:
         logging.info(f"Dictation mode set via tray -> {mode}")
         if self.tray_icon:
             self.tray_icon.show_notification("VoiceDrop — режим", f"Режим: {names.get(mode, mode)}")
+
+    def _apply_network_settings(self):
+        """Apply user-tunable ElevenLabs network settings (retries, read timeout)."""
+        s = load_settings()
+        self.elevenlabs_client.configure(
+            max_retries=s.get('max_retries'),
+            read_timeout=s.get('request_timeout_sec'),
+        )
 
     def _get_save_history(self) -> bool:
         """Whether transcriptions are saved to the history DB (default on)."""

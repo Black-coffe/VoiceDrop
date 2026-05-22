@@ -111,8 +111,8 @@ class SettingsWindow(ctk.CTkToplevel):
         self.settings = load_settings()
 
         self.title("VoiceDrop - Настройки")
-        self.geometry("500x600")
-        self.minsize(400, 560)
+        self.geometry("500x720")
+        self.minsize(400, 680)
         self.resizable(False, False)
 
         # Set window icon (need to wait for window to be created)
@@ -293,6 +293,37 @@ class SettingsWindow(ctk.CTkToplevel):
         self.retention_dropdown.grid(row=0, column=1, pady=15, padx=15, sticky="ew")
         self._set_retention_selection()
 
+        # ===== Advanced section =====
+        self.advanced_frame = ctk.CTkFrame(self)
+        self.advanced_frame.grid(row=6, column=0, pady=10, padx=20, sticky="ew")
+        self.advanced_frame.grid_columnconfigure(1, weight=1)
+
+        self.advanced_label = ctk.CTkLabel(
+            self.advanced_frame, text="Дополнительно",
+            font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.advanced_label.grid(row=0, column=0, columnspan=2, pady=(12, 4), padx=15, sticky="w")
+
+        self.min_dur_label = ctk.CTkLabel(
+            self.advanced_frame, text="Мин. длительность (мс):", font=ctk.CTkFont(size=12))
+        self.min_dur_label.grid(row=1, column=0, pady=4, padx=15, sticky="w")
+        self.min_dur_entry = ctk.CTkEntry(self.advanced_frame, width=100)
+        self.min_dur_entry.grid(row=1, column=1, pady=4, padx=15, sticky="e")
+
+        self.timeout_label = ctk.CTkLabel(
+            self.advanced_frame, text="Таймаут ответа (сек):", font=ctk.CTkFont(size=12))
+        self.timeout_label.grid(row=2, column=0, pady=4, padx=15, sticky="w")
+        self.timeout_entry = ctk.CTkEntry(self.advanced_frame, width=100)
+        self.timeout_entry.grid(row=2, column=1, pady=4, padx=15, sticky="e")
+
+        self.retries_label = ctk.CTkLabel(
+            self.advanced_frame, text="Ретраи при сбое (0–5):", font=ctk.CTkFont(size=12))
+        self.retries_label.grid(row=3, column=0, pady=(4, 12), padx=15, sticky="w")
+        self.retries_entry = ctk.CTkEntry(self.advanced_frame, width=100)
+        self.retries_entry.grid(row=3, column=1, pady=(4, 12), padx=15, sticky="e")
+
+        self._load_advanced()
+
         # Save button
         self.save_btn = ctk.CTkButton(
             self,
@@ -301,7 +332,7 @@ class SettingsWindow(ctk.CTkToplevel):
             height=40,
             command=self._save_settings
         )
-        self.save_btn.grid(row=6, column=0, pady=20, padx=20, sticky="ew")
+        self.save_btn.grid(row=7, column=0, pady=20, padx=20, sticky="ew")
 
         # Hide instead of destroy on close
         self.protocol("WM_DELETE_WINDOW", self.hide)
@@ -344,6 +375,15 @@ class SettingsWindow(ctk.CTkToplevel):
         cur = self.settings.get('history_retention_hours', 24)
         name = next((n for n, h in self.retention_options.items() if h == cur), "24 часа")
         self.retention_dropdown.set(name)
+
+    def _load_advanced(self):
+        """Fill advanced entries from settings."""
+        def setv(entry, val):
+            entry.delete(0, "end")
+            entry.insert(0, str(val))
+        setv(self.min_dur_entry, self.settings.get('min_duration_ms', 200))
+        setv(self.timeout_entry, self.settings.get('request_timeout_sec', 60))
+        setv(self.retries_entry, self.settings.get('max_retries', 3))
 
     def _load_microphones(self):
         """Load available microphones"""
@@ -557,6 +597,17 @@ class SettingsWindow(ctk.CTkToplevel):
         selected_retention = self.retention_dropdown.get()
         self.settings['history_retention_hours'] = self.retention_options.get(selected_retention, 24)
 
+        # Save advanced settings (clamped)
+        def clamp_int(entry, default, lo, hi):
+            try:
+                v = int(float(entry.get().strip()))
+            except (ValueError, AttributeError):
+                v = default
+            return max(lo, min(v, hi))
+        self.settings['min_duration_ms'] = clamp_int(self.min_dur_entry, 200, 50, 5000)
+        self.settings['request_timeout_sec'] = clamp_int(self.timeout_entry, 60, 10, 180)
+        self.settings['max_retries'] = clamp_int(self.retries_entry, 3, 0, 5)
+
         # Hotkey is already saved in self.settings during recording
 
         save_settings(self.settings)
@@ -597,6 +648,9 @@ class SettingsWindow(ctk.CTkToplevel):
 
         # Update retention display
         self._set_retention_selection()
+
+        # Update advanced fields
+        self._load_advanced()
 
         self._refresh_microphones()
         self.deiconify()

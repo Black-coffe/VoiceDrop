@@ -63,12 +63,32 @@ class ElevenLabsClient:
         self.api_key = api_key or ELEVENLABS_API_KEY
         self._client: Optional[httpx.Client] = None
         self.last_language_code: Optional[str] = None  # language scribe detected last
+        self.max_retries = _MAX_RETRIES
+        self.timeout = _TIMEOUT
+
+    def configure(self, max_retries: Optional[int] = None,
+                  read_timeout: Optional[float] = None):
+        """Apply user-tunable network settings (retries, read timeout)."""
+        if max_retries is not None:
+            try:
+                self.max_retries = max(0, min(int(max_retries), 5))
+            except (TypeError, ValueError):
+                pass
+        if read_timeout is not None:
+            try:
+                rt = max(10.0, min(float(read_timeout), 180.0))
+                self.timeout = httpx.Timeout(connect=10.0, read=rt, write=30.0, pool=5.0)
+                if self._client and not self._client.is_closed:
+                    self._client.close()  # rebuild with new timeout on next use
+                self._client = None
+            except (TypeError, ValueError):
+                pass
 
     def _get_client(self) -> httpx.Client:
         """Get or create HTTP client with connection pooling"""
         if self._client is None or self._client.is_closed:
             self._client = httpx.Client(
-                timeout=_TIMEOUT,
+                timeout=self.timeout,
                 limits=httpx.Limits(max_keepalive_connections=5)
             )
         return self._client
@@ -101,7 +121,7 @@ class ElevenLabsClient:
 
         last_error: Optional[TranscriptionError] = None
 
-        for attempt in range(_MAX_RETRIES + 1):
+        for attempt in range(self.max_retries + 1):
             # Rebuild the multipart payload each attempt (the body is consumed).
             files = {"file": ("audio.wav", audio_data, "audio/wav")}
 
@@ -141,13 +161,13 @@ class ElevenLabsClient:
                 is_retryable_status = response.status_code in _RETRY_STATUS
 
                 # Retryable HTTP status (rate limit / server hiccup)?
-                if is_retryable_status and attempt < _MAX_RETRIES:
+                if is_retryable_status and attempt < self.max_retries:
                     wait = self._retry_after(response)
                     if wait is None:
                         wait = self._backoff(attempt)
                     logging.warning(
                         f"ElevenLabs {response.status_code}, retrying in {wait:.1f}s "
-                        f"(attempt {attempt + 1}/{_MAX_RETRIES})"
+                        f"(attempt {attempt + 1}/{self.max_retries})"
                     )
                     time.sleep(wait)
                     continue
@@ -158,7 +178,7 @@ class ElevenLabsClient:
                 raise self._error_from_response(response, retryable=is_retryable_status)
 
             # We got here only from an exception branch; back off and retry.
-            if attempt < _MAX_RETRIES:
+            if attempt < self.max_retries:
                 time.sleep(self._backoff(attempt))
                 continue
             raise last_error
