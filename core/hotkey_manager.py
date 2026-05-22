@@ -19,6 +19,12 @@ MODIFIER_VKS = {
     91, 92,    # Win
 }
 
+# Right-hand modifier VKs. If a hotkey intentionally uses any of these, we match
+# EXACTLY (no left/right merging) so e.g. "Right Ctrl" never fires on the
+# constantly-used Left Ctrl. Hotkeys without a right modifier keep flexible L/R
+# matching (so Ctrl+Shift+Space still works with either side).
+RIGHT_MODIFIER_VKS = {163, 161, 165, 92}
+
 
 class HotkeyManager:
     def __init__(
@@ -96,9 +102,17 @@ class HotkeyManager:
             return 91
         return vk
 
+    def _exact_match_mode(self) -> bool:
+        """Match the hotkey exactly (no L/R normalization) when it intentionally
+        uses a right-hand modifier — so a right-side PTT key isn't triggered by
+        its left-side twin used for normal shortcuts."""
+        return any(vk in RIGHT_MODIFIER_VKS for vk in self.hotkey_vks)
+
     def _check_hotkey_match(self) -> bool:
         """Check if current keys match the hotkey combination"""
-        # Normalize both sets for comparison
+        if self._exact_match_mode():
+            return self.hotkey_vks.issubset(self._current_vks)
+        # Normalize both sets for comparison (flexible left/right)
         current_normalized = {self._normalize_vk(vk) for vk in self._current_vks}
         hotkey_normalized = {self._normalize_vk(vk) for vk in self.hotkey_vks}
         return hotkey_normalized.issubset(current_normalized)
@@ -127,12 +141,15 @@ class HotkeyManager:
         with self._lock:
             # Check if we should trigger release callback
             if self._is_hotkey_active:
-                # Normalize for comparison
-                normalized_vk = self._normalize_vk(vk)
-                hotkey_normalized = {self._normalize_vk(v) for v in self.hotkey_vks}
+                # If any key from the hotkey combination is released, stop.
+                if self._exact_match_mode():
+                    released_in_hotkey = vk in self.hotkey_vks
+                else:
+                    normalized_vk = self._normalize_vk(vk)
+                    hotkey_normalized = {self._normalize_vk(v) for v in self.hotkey_vks}
+                    released_in_hotkey = normalized_vk in hotkey_normalized
 
-                # If any key from hotkey combination is released
-                if normalized_vk in hotkey_normalized:
+                if released_in_hotkey:
                     self._is_hotkey_active = False
                     # Run callback in separate thread
                     threading.Thread(target=self.on_release_callback, daemon=True).start()
