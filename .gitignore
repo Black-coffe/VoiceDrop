@@ -18,6 +18,7 @@ replacements.json
 commands.json
 profiles.json
 mute_whitelist.json
+usage.json
 pending/
 
 # Log files

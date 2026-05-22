@@ -119,6 +119,7 @@ from core.pending_queue import PendingQueue
 from core.profiles import ProfileManager
 from core.text_replacer import TextReplacer
 from core.text_polisher import TextPolisher
+from core.usage_tracker import UsageTracker
 from core.voice_commands import VoiceCommands
 from core.text_inserter import TextInserter
 from gui.history_window import HistoryWindow
@@ -151,6 +152,7 @@ class VoiceDropApp:
         self.text_polisher = TextPolisher()
         self.voice_commands = VoiceCommands()
         self.profiles = ProfileManager()
+        self.usage = UsageTracker()
 
         self.tray_icon: Optional[TrayIcon] = None
         self.history_window: Optional[HistoryWindow] = None
@@ -413,6 +415,7 @@ class VoiceDropApp:
 
             # Save to database
             self.db.save_recording(text, duration_ms, was_inserted=inserted)
+            self.usage.record(duration_ms, len(text))
 
             # Play success sound
             winsound.Beep(800, 100)  # Short high-pitched beep
@@ -636,6 +639,23 @@ class VoiceDropApp:
         elif self.tray_icon:
             self.tray_icon.show_notification("VoiceDrop", "Нет последнего текста")
 
+    def _show_usage(self):
+        """Show ElevenLabs STT usage (requests, audio minutes, estimated cost)."""
+        rate = load_settings().get('stt_cost_per_hour', 0.40)
+        try:
+            rate = float(rate)
+        except (TypeError, ValueError):
+            rate = 0.40
+        s = self.usage.summary(cost_per_hour=rate)
+        msg = (
+            f"Сегодня: {s['today_requests']} зап., {s['today_min']:.1f} мин (≈${s['today_cost']:.3f})\n"
+            f"Всего: {s['total_requests']} зап., {s['total_min']:.1f} мин (≈${s['total_cost']:.2f})\n"
+            f"Ставка ≈${rate:g}/час (stt_cost_per_hour в settings.json)"
+        )
+        logging.info("Usage summary requested: " + msg.replace("\n", " | "))
+        if self.tray_icon:
+            self.tray_icon.show_notification("VoiceDrop — расход ElevenLabs", msg)
+
     def _retranscribe_last(self, language: str):
         """Re-transcribe the last recording with a forced language (RU/UK/EN bleed fix)."""
         audio = self._last_audio_data
@@ -664,6 +684,7 @@ class VoiceDropApp:
             self._last_text = text
             self.text_inserter.copy_to_clipboard(text)
             self.db.save_recording(text, duration_ms, was_inserted=False)
+            self.usage.record(duration_ms, len(text))
             winsound.Beep(800, 100)
             logging.info(f"Re-transcribed ({language}): {text[:50]}")
             if self.tray_icon:
@@ -827,6 +848,7 @@ class VoiceDropApp:
             get_mode=self._get_mode,
             on_retranscribe=self._retranscribe_last,
             on_copy_last=self._copy_last,
+            on_show_usage=self._show_usage,
             on_set_insert_mode=self._set_insert_mode,
             get_insert_mode=self._get_insert_mode,
             on_toggle_autostart=self._toggle_autostart,

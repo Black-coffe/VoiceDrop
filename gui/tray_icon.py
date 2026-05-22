@@ -69,6 +69,7 @@ class TrayIcon:
         get_mode: Optional[Callable[[], str]] = None,
         on_retranscribe: Optional[Callable[[str], None]] = None,
         on_copy_last: Optional[Callable[[], None]] = None,
+        on_show_usage: Optional[Callable[[], None]] = None,
         on_set_insert_mode: Optional[Callable[[str], None]] = None,
         get_insert_mode: Optional[Callable[[], str]] = None,
         on_toggle_autostart: Optional[Callable[[], None]] = None,
@@ -85,6 +86,7 @@ class TrayIcon:
         self.get_mode = get_mode
         self.on_retranscribe = on_retranscribe
         self.on_copy_last = on_copy_last
+        self.on_show_usage = on_show_usage
         self.on_set_insert_mode = on_set_insert_mode
         self.get_insert_mode = get_insert_mode
         self.on_toggle_autostart = on_toggle_autostart
@@ -151,6 +153,7 @@ class TrayIcon:
                 lambda icon, item: self._handle_toggle_autostart(),
                 checked=lambda item: self._current_autostart(),
             ),
+            Item("Расход ElevenLabs", lambda icon, item: self._handle_show_usage()),
             Item("Настройки", self._on_settings),
             pystray.Menu.SEPARATOR,
             Item("Выход", self._on_quit)
@@ -208,6 +211,10 @@ class TrayIcon:
     def _handle_copy_last(self):
         if self.on_copy_last:
             threading.Thread(target=self.on_copy_last, daemon=True).start()
+
+    def _handle_show_usage(self):
+        if self.on_show_usage:
+            threading.Thread(target=self.on_show_usage, daemon=True).start()
 
     def _current_insert_mode(self) -> str:
         if self.get_insert_mode:
