@@ -3,15 +3,18 @@ Audio Muter - Mutes system audio during recording
 Uses Windows Audio Session API via pycaw
 """
 from typing import Dict, List, Optional, Tuple, Set
+import json
 import threading
 import logging
 
 from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
 
+from config import BASE_DIR
+
 
 class AudioMuter:
-    # Applications that should NEVER be muted (browsers, communication apps)
-    WHITELIST_PROCESSES = {
+    # Default apps never muted while recording (editable via mute_whitelist.json)
+    DEFAULT_WHITELIST = {
         'chrome.exe',
         'firefox.exe',
         'msedge.exe',
@@ -31,6 +34,51 @@ class AudioMuter:
         self._lock = threading.Lock()
         self._is_muted = False
         self._muted_pids: Set[int] = set()  # Track which PIDs we actually muted
+        # Editable, hot-reloaded whitelist file (apps NOT to mute)
+        self._whitelist_path = BASE_DIR / "mute_whitelist.json"
+        self._whitelist_raw: Optional[str] = None
+        self._whitelist: Set[str] = set(self.DEFAULT_WHITELIST)
+        if not self._whitelist_path.exists():
+            self._seed_whitelist()
+        self._load_whitelist()
+
+    def _seed_whitelist(self):
+        payload = {
+            "_comment": ("Приложения, которые НЕ глушить во время записи (имена "
+                         "процессов в нижнем регистре, с .exe). Файл подхватывается "
+                         "на лету. Пустой список = глушить всё."),
+            "whitelist": sorted(self.DEFAULT_WHITELIST),
+        }
+        try:
+            with open(self._whitelist_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            logging.info(f"Seeded mute whitelist: {self._whitelist_path}")
+        except Exception as e:
+            logging.error(f"Could not seed mute whitelist: {e}")
+
+    def _load_whitelist(self):
+        """Reload the whitelist if mute_whitelist.json content changed."""
+        raw: Optional[str] = None
+        if self._whitelist_path.exists():
+            try:
+                with open(self._whitelist_path, 'r', encoding='utf-8') as f:
+                    raw = f.read()
+            except Exception as e:
+                logging.error(f"Failed to read mute_whitelist.json: {e}")
+        if raw == self._whitelist_raw:
+            return
+        self._whitelist_raw = raw
+        wl: Set[str] = set(self.DEFAULT_WHITELIST)
+        if raw is not None:
+            try:
+                data = json.loads(raw)
+                items = data.get("whitelist", []) if isinstance(data, dict) else []
+                wl = {str(x).strip().lower() for x in items if str(x).strip()}
+            except Exception as e:
+                logging.error(f"Failed to parse mute_whitelist.json: {e}")
+                wl = set(self.DEFAULT_WHITELIST)
+        self._whitelist = wl
+        logging.info(f"Loaded {len(self._whitelist)} mute-whitelist app(s)")
 
     def _get_audio_sessions(self) -> List:
         """Get all active audio sessions"""
@@ -43,7 +91,7 @@ class AudioMuter:
 
     def _is_whitelisted(self, process_name: str) -> bool:
         """Check if a process should not be muted"""
-        return process_name.lower() in self.WHITELIST_PROCESSES
+        return process_name.lower() in self._whitelist
 
     def mute_all(self) -> bool:
         """
@@ -52,6 +100,7 @@ class AudioMuter:
         Returns:
             True if successful
         """
+        self._load_whitelist()
         with self._lock:
             if self._is_muted:
                 return True
@@ -110,6 +159,7 @@ class AudioMuter:
         Returns:
             True if successful
         """
+        self._load_whitelist()
         with self._lock:
             try:
                 sessions = self._get_audio_sessions()
@@ -168,6 +218,7 @@ class AudioMuter:
         Returns:
             True if successful
         """
+        self._load_whitelist()
         try:
             sessions = self._get_audio_sessions()
             unmuted_count = 0

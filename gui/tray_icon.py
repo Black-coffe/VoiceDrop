@@ -70,6 +70,8 @@ class TrayIcon:
         on_retranscribe: Optional[Callable[[str], None]] = None,
         on_set_insert_mode: Optional[Callable[[str], None]] = None,
         get_insert_mode: Optional[Callable[[], str]] = None,
+        on_toggle_autostart: Optional[Callable[[], None]] = None,
+        get_autostart: Optional[Callable[[], bool]] = None,
     ):
         self.on_show_history = on_show_history
         self.on_quit = on_quit
@@ -83,6 +85,8 @@ class TrayIcon:
         self.on_retranscribe = on_retranscribe
         self.on_set_insert_mode = on_set_insert_mode
         self.get_insert_mode = get_insert_mode
+        self.on_toggle_autostart = on_toggle_autostart
+        self.get_autostart = get_autostart
 
         self._icon: Optional[pystray.Icon] = None
         self._icon_normal = create_icon_image("#4CAF50")  # Green
@@ -138,6 +142,11 @@ class TrayIcon:
                 "Полировка текста (LLM)",
                 lambda icon, item: self._handle_toggle_polish(),
                 checked=lambda item: self._current_polish(),
+            ),
+            Item(
+                "Автозапуск с Windows",
+                lambda icon, item: self._handle_toggle_autostart(),
+                checked=lambda item: self._current_autostart(),
             ),
             Item("Настройки", self._on_settings),
             pystray.Menu.SEPARATOR,
@@ -226,6 +235,18 @@ class TrayIcon:
         """Toggle LLM polish (off the tray thread)."""
         if self.on_toggle_polish:
             threading.Thread(target=self.on_toggle_polish, daemon=True).start()
+
+    def _current_autostart(self) -> bool:
+        if self.get_autostart:
+            try:
+                return bool(self.get_autostart())
+            except Exception:
+                return False
+        return False
+
+    def _handle_toggle_autostart(self):
+        if self.on_toggle_autostart:
+            threading.Thread(target=self.on_toggle_autostart, daemon=True).start()
 
     def _on_show_history(self, icon, item):
         """Handle show history menu click"""

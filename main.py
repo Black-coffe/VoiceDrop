@@ -109,6 +109,7 @@ import customtkinter as ctk
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import ELEVENLABS_API_KEY
+from core import autostart
 from core.audio_muter import AudioMuter
 from core.audio_recorder import AudioRecorder
 from core.db_manager import DatabaseManager
@@ -576,6 +577,21 @@ class VoiceDropApp:
         if self.tray_icon:
             self.tray_icon.show_notification("VoiceDrop — режим", f"Режим: {names.get(mode, mode)}")
 
+    def _get_autostart(self) -> bool:
+        """Whether VoiceDrop launches on Windows login (for the tray checkmark)."""
+        return autostart.is_enabled()
+
+    def _toggle_autostart(self):
+        """Toggle launch-on-login from the tray."""
+        new_value = not autostart.is_enabled()
+        ok = autostart.set_enabled(new_value)
+        if self.tray_icon:
+            if ok:
+                state = "включён" if new_value else "выключен"
+                self.tray_icon.show_notification("VoiceDrop — автозапуск", f"Автозапуск {state}")
+            else:
+                self.tray_icon.show_notification("VoiceDrop — автозапуск", "Не удалось изменить")
+
     def _get_insert_mode(self) -> str:
         """How transcribed text is delivered: 'window' | 'clipboard' | 'enter'."""
         return load_settings().get('insert_mode', 'window')
@@ -779,7 +795,9 @@ class VoiceDropApp:
             get_mode=self._get_mode,
             on_retranscribe=self._retranscribe_last,
             on_set_insert_mode=self._set_insert_mode,
-            get_insert_mode=self._get_insert_mode
+            get_insert_mode=self._get_insert_mode,
+            on_toggle_autostart=self._toggle_autostart,
+            get_autostart=self._get_autostart
         )
 
         # Run tray icon in separate thread (it blocks)
