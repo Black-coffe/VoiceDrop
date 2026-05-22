@@ -413,8 +413,9 @@ class VoiceDropApp:
             else:  # "window"
                 inserted = self.text_inserter.insert_text(text)
 
-            # Save to database
-            self.db.save_recording(text, duration_ms, was_inserted=inserted)
+            # Save to database (unless history saving is disabled for privacy)
+            if self._get_save_history():
+                self.db.save_recording(text, duration_ms, was_inserted=inserted)
             self.usage.record(duration_ms, len(text))
 
             # Play success sound
@@ -494,8 +495,9 @@ class VoiceDropApp:
 
             text = (text or "").strip()
             if text:
-                self.db.save_recording(text, item.get('duration_ms', 0), was_inserted=False)
-                logging.info(f"Pending item recovered -> history: {text[:50]}")
+                if self._get_save_history():
+                    self.db.save_recording(text, item.get('duration_ms', 0), was_inserted=False)
+                logging.info(f"Pending item recovered: {text[:50]}")
                 if self.tray_icon:
                     preview = text[:60] + ('…' if len(text) > 60 else '')
                     self.tray_icon.show_notification(
@@ -599,6 +601,21 @@ class VoiceDropApp:
         if self.tray_icon:
             self.tray_icon.show_notification("VoiceDrop — режим", f"Режим: {names.get(mode, mode)}")
 
+    def _get_save_history(self) -> bool:
+        """Whether transcriptions are saved to the history DB (default on)."""
+        return bool(load_settings().get('save_history', True))
+
+    def _toggle_save_history(self):
+        """Toggle history saving from the tray."""
+        settings = load_settings()
+        new_value = not bool(settings.get('save_history', True))
+        settings['save_history'] = new_value
+        save_settings(settings)
+        logging.info(f"Save history toggled via tray -> {new_value}")
+        if self.tray_icon:
+            state = "включено" if new_value else "выключено"
+            self.tray_icon.show_notification("VoiceDrop — история", f"Сохранение истории {state}")
+
     def _get_autostart(self) -> bool:
         """Whether VoiceDrop launches on Windows login (for the tray checkmark)."""
         return autostart.is_enabled()
@@ -683,7 +700,8 @@ class VoiceDropApp:
             text = self.voice_commands.apply(text)
             self._last_text = text
             self.text_inserter.copy_to_clipboard(text)
-            self.db.save_recording(text, duration_ms, was_inserted=False)
+            if self._get_save_history():
+                self.db.save_recording(text, duration_ms, was_inserted=False)
             self.usage.record(duration_ms, len(text))
             winsound.Beep(800, 100)
             logging.info(f"Re-transcribed ({language}): {text[:50]}")
@@ -852,7 +870,9 @@ class VoiceDropApp:
             on_set_insert_mode=self._set_insert_mode,
             get_insert_mode=self._get_insert_mode,
             on_toggle_autostart=self._toggle_autostart,
-            get_autostart=self._get_autostart
+            get_autostart=self._get_autostart,
+            on_toggle_save_history=self._toggle_save_history,
+            get_save_history=self._get_save_history
         )
 
         # Run tray icon in separate thread (it blocks)

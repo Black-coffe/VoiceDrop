@@ -74,6 +74,8 @@ class TrayIcon:
         get_insert_mode: Optional[Callable[[], str]] = None,
         on_toggle_autostart: Optional[Callable[[], None]] = None,
         get_autostart: Optional[Callable[[], bool]] = None,
+        on_toggle_save_history: Optional[Callable[[], None]] = None,
+        get_save_history: Optional[Callable[[], bool]] = None,
     ):
         self.on_show_history = on_show_history
         self.on_quit = on_quit
@@ -91,6 +93,8 @@ class TrayIcon:
         self.get_insert_mode = get_insert_mode
         self.on_toggle_autostart = on_toggle_autostart
         self.get_autostart = get_autostart
+        self.on_toggle_save_history = on_toggle_save_history
+        self.get_save_history = get_save_history
 
         self._icon: Optional[pystray.Icon] = None
         self._icon_normal = create_icon_image("#4CAF50")  # Green
@@ -154,6 +158,11 @@ class TrayIcon:
                 checked=lambda item: self._current_autostart(),
             ),
             Item("Расход ElevenLabs", lambda icon, item: self._handle_show_usage()),
+            Item(
+                "Сохранять историю",
+                lambda icon, item: self._handle_toggle_save_history(),
+                checked=lambda item: self._current_save_history(),
+            ),
             Item("Настройки", self._on_settings),
             pystray.Menu.SEPARATOR,
             Item("Выход", self._on_quit)
@@ -215,6 +224,18 @@ class TrayIcon:
     def _handle_show_usage(self):
         if self.on_show_usage:
             threading.Thread(target=self.on_show_usage, daemon=True).start()
+
+    def _current_save_history(self) -> bool:
+        if self.get_save_history:
+            try:
+                return bool(self.get_save_history())
+            except Exception:
+                return True
+        return True
+
+    def _handle_toggle_save_history(self):
+        if self.on_toggle_save_history:
+            threading.Thread(target=self.on_toggle_save_history, daemon=True).start()
 
     def _current_insert_mode(self) -> str:
         if self.get_insert_mode:

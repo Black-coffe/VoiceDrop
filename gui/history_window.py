@@ -4,7 +4,7 @@ History Window - Shows recording history with copy functionality
 import os
 import sys
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -90,6 +90,16 @@ class HistoryWindow(ctk.CTkToplevel):
             command=self._export
         )
         self.export_btn.grid(row=1, column=1, padx=10, pady=(0, 10))
+
+        self.clear_btn = ctk.CTkButton(
+            self.header_frame,
+            text="Очистить",
+            width=100,
+            fg_color="#8B2E2E",
+            hover_color="#A33A3A",
+            command=self._clear_history
+        )
+        self.clear_btn.grid(row=1, column=2, padx=(0, 10), pady=(0, 10))
 
         # Scrollable frame for recordings
         self.scroll_frame = ctk.CTkScrollableFrame(self)
@@ -192,6 +202,15 @@ class HistoryWindow(ctk.CTkToplevel):
             command=lambda t=text: self._copy_text(t)
         )
         copy_btn.grid(row=0, column=2, padx=10, pady=8, sticky="n" if is_latest else "")
+
+    def _clear_history(self):
+        """Delete all recordings after confirmation."""
+        if messagebox.askyesno("Очистить историю",
+                               "Удалить ВСЕ записи из истории? Это необратимо.",
+                               parent=self):
+            self.db.clear_all()
+            self.refresh_list()
+            self.status_label.configure(text="История очищена")
 
     def _export(self):
         """Export all stored recordings to a .md or .txt file."""
