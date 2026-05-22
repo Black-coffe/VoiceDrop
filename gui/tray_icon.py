@@ -63,12 +63,16 @@ class TrayIcon:
         on_settings: Optional[Callable[[], None]] = None,
         on_set_language: Optional[Callable[[Optional[str]], None]] = None,
         get_language: Optional[Callable[[], Optional[str]]] = None,
+        on_toggle_polish: Optional[Callable[[], None]] = None,
+        get_polish_enabled: Optional[Callable[[], bool]] = None,
     ):
         self.on_show_history = on_show_history
         self.on_quit = on_quit
         self.on_settings = on_settings
         self.on_set_language = on_set_language
         self.get_language = get_language
+        self.on_toggle_polish = on_toggle_polish
+        self.get_polish_enabled = get_polish_enabled
 
         self._icon: Optional[pystray.Icon] = None
         self._icon_normal = create_icon_image("#4CAF50")  # Green
@@ -95,6 +99,11 @@ class TrayIcon:
             Item("Язык", pystray.Menu(
                 *[self._lang_item(label, code) for label, code in self.LANGUAGE_OPTIONS]
             )),
+            Item(
+                "Полировка текста (LLM)",
+                lambda icon, item: self._handle_toggle_polish(),
+                checked=lambda item: self._current_polish(),
+            ),
             Item("Настройки", self._on_settings),
             pystray.Menu.SEPARATOR,
             Item("Выход", self._on_quit)
@@ -122,6 +131,20 @@ class TrayIcon:
         """Apply a language choice (off the tray thread so the menu stays snappy)."""
         if self.on_set_language:
             threading.Thread(target=self.on_set_language, args=(code,), daemon=True).start()
+
+    def _current_polish(self) -> bool:
+        """Whether LLM polish is currently enabled (for the menu checkmark)."""
+        if self.get_polish_enabled:
+            try:
+                return bool(self.get_polish_enabled())
+            except Exception:
+                return False
+        return False
+
+    def _handle_toggle_polish(self):
+        """Toggle LLM polish (off the tray thread)."""
+        if self.on_toggle_polish:
+            threading.Thread(target=self.on_toggle_polish, daemon=True).start()
 
     def _on_show_history(self, icon, item):
         """Handle show history menu click"""

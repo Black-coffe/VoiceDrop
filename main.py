@@ -116,6 +116,7 @@ from core.elevenlabs_api import ElevenLabsClient, TranscriptionError
 from core.hotkey_manager import HotkeyManager
 from core.pending_queue import PendingQueue
 from core.text_replacer import TextReplacer
+from core.text_polisher import TextPolisher
 from core.voice_commands import VoiceCommands
 from core.text_inserter import TextInserter
 from gui.history_window import HistoryWindow
@@ -144,6 +145,7 @@ class VoiceDropApp:
         self.db = DatabaseManager()
         self.pending_queue = PendingQueue()
         self.text_replacer = TextReplacer()
+        self.text_polisher = TextPolisher()
         self.voice_commands = VoiceCommands()
 
         self.tray_icon: Optional[TrayIcon] = None
@@ -350,6 +352,10 @@ class VoiceDropApp:
 
             text = text.strip()
 
+            # Optional LLM polish (filler removal, punctuation) — runs on raw prose,
+            # before the deterministic passes. Best-effort: returns original on error.
+            if self._get_polish_enabled():
+                text = self.text_polisher.polish(text, language=language)
             # Custom dictionary: fix tech terms / names STT mangles (local, instant)
             text = self.text_replacer.apply(text)
             # Voice formatting commands: "новая строка", "код блок", ... -> symbols
@@ -518,6 +524,21 @@ class VoiceDropApp:
         if self.tray_icon:
             self.tray_icon.show_notification("VoiceDrop — язык", f"Язык распознавания: {name}")
 
+    def _get_polish_enabled(self) -> bool:
+        """Whether LLM polish is on (default on). Used by pipeline and tray."""
+        return bool(load_settings().get('polish_enabled', True))
+
+    def _toggle_polish(self):
+        """Toggle LLM polish from the tray; applies to the next recording."""
+        settings = load_settings()
+        new_value = not bool(settings.get('polish_enabled', True))
+        settings['polish_enabled'] = new_value
+        save_settings(settings)
+        logging.info(f"LLM polish toggled via tray -> {new_value}")
+        if self.tray_icon:
+            state = "включена" if new_value else "выключена"
+            self.tray_icon.show_notification("VoiceDrop — полировка", f"LLM-полировка {state}")
+
     def _show_history(self):
         """Show history window"""
         if self._root:
@@ -577,6 +598,11 @@ class VoiceDropApp:
             self.elevenlabs_client.close()
         except Exception as e:
             logging.error(f"Error closing ElevenLabs client: {e}")
+
+        try:
+            self.text_polisher.close()
+        except Exception as e:
+            logging.error(f"Error closing text polisher: {e}")
 
         try:
             self.db.close()
@@ -653,7 +679,9 @@ class VoiceDropApp:
             on_quit=self._on_quit,
             on_settings=self._show_settings,
             on_set_language=self._set_language,
-            get_language=self._get_language
+            get_language=self._get_language,
+            on_toggle_polish=self._toggle_polish,
+            get_polish_enabled=self._get_polish_enabled
         )
 
         # Run tray icon in separate thread (it blocks)

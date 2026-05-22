@@ -24,6 +24,10 @@ load_dotenv(BASE_DIR / ".env")
 # ElevenLabs API Configuration
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 
+# Anthropic API — for optional LLM text polishing (filler removal, punctuation)
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+POLISH_MODEL = "claude-haiku-4-5"
+
 # Hotkey configuration (default: Ctrl + Shift + Space)
 HOTKEY_MODIFIER = "ctrl+shift"
 HOTKEY_KEY = "space"
