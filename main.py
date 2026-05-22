@@ -115,6 +115,7 @@ from core.db_manager import DatabaseManager
 from core.elevenlabs_api import ElevenLabsClient, TranscriptionError
 from core.hotkey_manager import HotkeyManager
 from core.pending_queue import PendingQueue
+from core.profiles import ProfileManager
 from core.text_replacer import TextReplacer
 from core.text_polisher import TextPolisher
 from core.voice_commands import VoiceCommands
@@ -147,6 +148,7 @@ class VoiceDropApp:
         self.text_replacer = TextReplacer()
         self.text_polisher = TextPolisher()
         self.voice_commands = VoiceCommands()
+        self.profiles = ProfileManager()
 
         self.tray_icon: Optional[TrayIcon] = None
         self.history_window: Optional[HistoryWindow] = None
@@ -352,14 +354,20 @@ class VoiceDropApp:
 
             text = text.strip()
 
-            # Optional LLM polish (filler removal, punctuation) — runs on raw prose,
-            # before the deterministic passes. Best-effort: returns original on error.
-            if self._get_polish_enabled():
+            # Resolve dictation mode (auto by foreground app, or forced text/code)
+            mode = self._effective_mode()
+
+            # Optional LLM polish — text mode only (code mode stays verbatim).
+            # Best-effort: returns original on error.
+            if mode == "text" and self._get_polish_enabled():
                 text = self.text_polisher.polish(text, language=language)
             # Custom dictionary: fix tech terms / names STT mangles (local, instant)
             text = self.text_replacer.apply(text)
             # Voice formatting commands: "новая строка", "код блок", ... -> symbols
             text = self.voice_commands.apply(text)
+            # Code mode: verbatim style (drop trailing period, lowercase Latin start)
+            if mode == "code":
+                text = self.profiles.apply_code_style(text)
 
             # Show word count on overlay
             word_count = len(text.split())
@@ -539,6 +547,24 @@ class VoiceDropApp:
             state = "включена" if new_value else "выключена"
             self.tray_icon.show_notification("VoiceDrop — полировка", f"LLM-полировка {state}")
 
+    def _get_mode(self) -> str:
+        """Dictation mode setting: 'auto' | 'text' | 'code' (default auto)."""
+        return load_settings().get('dictation_mode', 'auto')
+
+    def _effective_mode(self) -> str:
+        """Resolve the setting to a concrete 'text' or 'code' for this recording."""
+        return self.profiles.effective_mode(self._get_mode())
+
+    def _set_mode(self, mode: str):
+        """Set dictation mode from the tray; applies to the next recording."""
+        settings = load_settings()
+        settings['dictation_mode'] = mode
+        save_settings(settings)
+        names = {'auto': 'Авто', 'text': 'Текст', 'code': 'Код'}
+        logging.info(f"Dictation mode set via tray -> {mode}")
+        if self.tray_icon:
+            self.tray_icon.show_notification("VoiceDrop — режим", f"Режим: {names.get(mode, mode)}")
+
     def _show_history(self):
         """Show history window"""
         if self._root:
@@ -681,7 +707,9 @@ class VoiceDropApp:
             on_set_language=self._set_language,
             get_language=self._get_language,
             on_toggle_polish=self._toggle_polish,
-            get_polish_enabled=self._get_polish_enabled
+            get_polish_enabled=self._get_polish_enabled,
+            on_set_mode=self._set_mode,
+            get_mode=self._get_mode
         )
 
         # Run tray icon in separate thread (it blocks)

@@ -65,6 +65,8 @@ class TrayIcon:
         get_language: Optional[Callable[[], Optional[str]]] = None,
         on_toggle_polish: Optional[Callable[[], None]] = None,
         get_polish_enabled: Optional[Callable[[], bool]] = None,
+        on_set_mode: Optional[Callable[[str], None]] = None,
+        get_mode: Optional[Callable[[], str]] = None,
     ):
         self.on_show_history = on_show_history
         self.on_quit = on_quit
@@ -73,6 +75,8 @@ class TrayIcon:
         self.get_language = get_language
         self.on_toggle_polish = on_toggle_polish
         self.get_polish_enabled = get_polish_enabled
+        self.on_set_mode = on_set_mode
+        self.get_mode = get_mode
 
         self._icon: Optional[pystray.Icon] = None
         self._icon_normal = create_icon_image("#4CAF50")  # Green
@@ -92,10 +96,20 @@ class TrayIcon:
         ("English", "en"),
     ]
 
+    # Dictation mode: label -> setting value
+    MODE_OPTIONS = [
+        ("Авто (по приложению)", "auto"),
+        ("Текст", "text"),
+        ("Код", "code"),
+    ]
+
     def _create_menu(self):
         """Create the tray menu"""
         return pystray.Menu(
             Item("Открыть историю", self._on_show_history, default=True),
+            Item("Режим", pystray.Menu(
+                *[self._mode_item(label, value) for label, value in self.MODE_OPTIONS]
+            )),
             Item("Язык", pystray.Menu(
                 *[self._lang_item(label, code) for label, code in self.LANGUAGE_OPTIONS]
             )),
@@ -131,6 +145,27 @@ class TrayIcon:
         """Apply a language choice (off the tray thread so the menu stays snappy)."""
         if self.on_set_language:
             threading.Thread(target=self.on_set_language, args=(code,), daemon=True).start()
+
+    def _current_mode(self) -> str:
+        """Current dictation mode setting (for the radio checkmark)."""
+        if self.get_mode:
+            try:
+                return self.get_mode()
+            except Exception:
+                return "auto"
+        return "auto"
+
+    def _mode_item(self, label: str, value: str) -> Item:
+        return Item(
+            label,
+            lambda icon, item: self._handle_set_mode(value),
+            checked=lambda item: self._current_mode() == value,
+            radio=True,
+        )
+
+    def _handle_set_mode(self, value: str):
+        if self.on_set_mode:
+            threading.Thread(target=self.on_set_mode, args=(value,), daemon=True).start()
 
     def _current_polish(self) -> bool:
         """Whether LLM polish is currently enabled (for the menu checkmark)."""
