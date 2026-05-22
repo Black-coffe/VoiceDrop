@@ -115,6 +115,7 @@ from core.db_manager import DatabaseManager
 from core.elevenlabs_api import ElevenLabsClient, TranscriptionError
 from core.hotkey_manager import HotkeyManager
 from core.pending_queue import PendingQueue
+from core.text_replacer import TextReplacer
 from core.text_inserter import TextInserter
 from gui.history_window import HistoryWindow
 from gui.recording_overlay import RecordingOverlay
@@ -141,6 +142,7 @@ class VoiceDropApp:
         self.text_inserter = TextInserter()
         self.db = DatabaseManager()
         self.pending_queue = PendingQueue()
+        self.text_replacer = TextReplacer()
 
         self.tray_icon: Optional[TrayIcon] = None
         self.history_window: Optional[HistoryWindow] = None
@@ -345,6 +347,9 @@ class VoiceDropApp:
                 return
 
             text = text.strip()
+
+            # Custom dictionary: fix tech terms / names STT mangles (local, instant)
+            text = self.text_replacer.apply(text)
 
             # Show word count on overlay
             word_count = len(text.split())
