@@ -68,6 +68,8 @@ class TrayIcon:
         on_set_mode: Optional[Callable[[str], None]] = None,
         get_mode: Optional[Callable[[], str]] = None,
         on_retranscribe: Optional[Callable[[str], None]] = None,
+        on_set_insert_mode: Optional[Callable[[str], None]] = None,
+        get_insert_mode: Optional[Callable[[], str]] = None,
     ):
         self.on_show_history = on_show_history
         self.on_quit = on_quit
@@ -79,6 +81,8 @@ class TrayIcon:
         self.on_set_mode = on_set_mode
         self.get_mode = get_mode
         self.on_retranscribe = on_retranscribe
+        self.on_set_insert_mode = on_set_insert_mode
+        self.get_insert_mode = get_insert_mode
 
         self._icon: Optional[pystray.Icon] = None
         self._icon_normal = create_icon_image("#4CAF50")  # Green
@@ -105,12 +109,22 @@ class TrayIcon:
         ("Код", "code"),
     ]
 
+    # Insert mode: label -> setting value
+    INSERT_OPTIONS = [
+        ("В окно", "window"),
+        ("Только в буфер", "clipboard"),
+        ("В окно + Enter", "enter"),
+    ]
+
     def _create_menu(self):
         """Create the tray menu"""
         return pystray.Menu(
             Item("Открыть историю", self._on_show_history, default=True),
             Item("Режим", pystray.Menu(
                 *[self._mode_item(label, value) for label, value in self.MODE_OPTIONS]
+            )),
+            Item("Вставка", pystray.Menu(
+                *[self._insert_item(label, value) for label, value in self.INSERT_OPTIONS]
             )),
             Item("Язык", pystray.Menu(
                 *[self._lang_item(label, code) for label, code in self.LANGUAGE_OPTIONS]
@@ -178,6 +192,26 @@ class TrayIcon:
         """Re-transcribe the last recording in a forced language (off the tray thread)."""
         if self.on_retranscribe:
             threading.Thread(target=self.on_retranscribe, args=(language,), daemon=True).start()
+
+    def _current_insert_mode(self) -> str:
+        if self.get_insert_mode:
+            try:
+                return self.get_insert_mode()
+            except Exception:
+                return "window"
+        return "window"
+
+    def _insert_item(self, label: str, value: str) -> Item:
+        return Item(
+            label,
+            lambda icon, item: self._handle_set_insert_mode(value),
+            checked=lambda item: self._current_insert_mode() == value,
+            radio=True,
+        )
+
+    def _handle_set_insert_mode(self, value: str):
+        if self.on_set_insert_mode:
+            threading.Thread(target=self.on_set_insert_mode, args=(value,), daemon=True).start()
 
     def _current_polish(self) -> bool:
         """Whether LLM polish is currently enabled (for the menu checkmark)."""

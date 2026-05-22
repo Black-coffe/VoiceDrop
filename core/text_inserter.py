@@ -10,6 +10,7 @@ import pyperclip
 # Windows API constants
 VK_CONTROL = 0x11
 VK_V = 0x56
+VK_RETURN = 0x0D
 KEYEVENTF_KEYUP = 0x0002
 
 # Load user32.dll
@@ -42,9 +43,13 @@ class TextInserter:
         # Release Ctrl
         self._send_key(VK_CONTROL, key_up=True)
 
-    def insert_text(self, text: str) -> bool:
+    def insert_text(self, text: str, press_enter: bool = False) -> bool:
         """
-        Insert text at current cursor position using clipboard paste
+        Insert text at current cursor position using clipboard paste.
+
+        Args:
+            text: text to paste
+            press_enter: send Enter after pasting (auto-send in chats)
 
         Returns:
             True if successful, False otherwise
@@ -64,6 +69,12 @@ class TextInserter:
 
             # Small delay after paste
             time.sleep(0.05)
+
+            if press_enter:
+                time.sleep(0.05)
+                self._send_key(VK_RETURN, key_up=False)
+                time.sleep(0.02)
+                self._send_key(VK_RETURN, key_up=True)
 
             return True
 

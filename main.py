@@ -384,11 +384,15 @@ class VoiceDropApp:
                 # Hide overlay after 1.5 seconds
                 self._root.after(1500, self.recording_overlay.hide)
 
-            # Copy to clipboard
-            self.text_inserter.copy_to_clipboard(text)
-
-            # Insert at cursor
-            inserted = self.text_inserter.insert_text(text)
+            # Deliver text per the chosen insert mode
+            insert_mode = self._get_insert_mode()
+            if insert_mode == "clipboard":
+                self.text_inserter.copy_to_clipboard(text)
+                inserted = False
+            elif insert_mode == "enter":
+                inserted = self.text_inserter.insert_text(text, press_enter=True)
+            else:  # "window"
+                inserted = self.text_inserter.insert_text(text)
 
             # Save to database
             self.db.save_recording(text, duration_ms, was_inserted=inserted)
@@ -571,6 +575,20 @@ class VoiceDropApp:
         logging.info(f"Dictation mode set via tray -> {mode}")
         if self.tray_icon:
             self.tray_icon.show_notification("VoiceDrop — режим", f"Режим: {names.get(mode, mode)}")
+
+    def _get_insert_mode(self) -> str:
+        """How transcribed text is delivered: 'window' | 'clipboard' | 'enter'."""
+        return load_settings().get('insert_mode', 'window')
+
+    def _set_insert_mode(self, mode: str):
+        """Set insert mode from the tray; applies to the next recording."""
+        settings = load_settings()
+        settings['insert_mode'] = mode
+        save_settings(settings)
+        names = {'window': 'В окно', 'clipboard': 'Только в буфер', 'enter': 'В окно + Enter'}
+        logging.info(f"Insert mode set via tray -> {mode}")
+        if self.tray_icon:
+            self.tray_icon.show_notification("VoiceDrop — вставка", names.get(mode, mode))
 
     def _retranscribe_last(self, language: str):
         """Re-transcribe the last recording with a forced language (RU/UK/EN bleed fix)."""
@@ -759,7 +777,9 @@ class VoiceDropApp:
             get_polish_enabled=self._get_polish_enabled,
             on_set_mode=self._set_mode,
             get_mode=self._get_mode,
-            on_retranscribe=self._retranscribe_last
+            on_retranscribe=self._retranscribe_last,
+            on_set_insert_mode=self._set_insert_mode,
+            get_insert_mode=self._get_insert_mode
         )
 
         # Run tray icon in separate thread (it blocks)
