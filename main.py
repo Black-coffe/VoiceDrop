@@ -108,7 +108,7 @@ if sys.platform == 'win32':
 import customtkinter as ctk
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from config import ELEVENLABS_API_KEY
+from config import ELEVENLABS_API_KEY, HISTORY_RETENTION_HOURS
 from core import autostart
 from core.audio_muter import AudioMuter
 from core.audio_recorder import AudioRecorder
@@ -145,6 +145,7 @@ class VoiceDropApp:
         self.elevenlabs_client = ElevenLabsClient()
         self.text_inserter = TextInserter()
         self.db = DatabaseManager()
+        self.db.set_retention(load_settings().get('history_retention_hours', HISTORY_RETENTION_HOURS))
         self.pending_queue = PendingQueue()
         self.text_replacer = TextReplacer()
         self.text_polisher = TextPolisher()
@@ -543,6 +544,9 @@ class VoiceDropApp:
         if hotkey and 'keys' in hotkey and self.hotkey_manager:
             self.hotkey_manager.set_hotkey(hotkey['keys'])
             logging.info(f"Hotkey changed to: {hotkey.get('display', 'Unknown')}")
+
+        # Apply history retention
+        self.db.set_retention(settings.get('history_retention_hours', HISTORY_RETENTION_HOURS))
 
     def _get_language(self) -> Optional[str]:
         """Current language code from settings (None = auto). Used by the tray menu."""

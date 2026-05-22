@@ -111,8 +111,8 @@ class SettingsWindow(ctk.CTkToplevel):
         self.settings = load_settings()
 
         self.title("VoiceDrop - Настройки")
-        self.geometry("500x520")
-        self.minsize(400, 480)
+        self.geometry("500x600")
+        self.minsize(400, 560)
         self.resizable(False, False)
 
         # Set window icon (need to wait for window to be created)
@@ -270,6 +270,29 @@ class SettingsWindow(ctk.CTkToplevel):
         )
         self.hotkey_hint.grid(row=4, column=0, pady=(0, 5), padx=20, sticky="w")
 
+        # ===== History retention section =====
+        self.retention_frame = ctk.CTkFrame(self)
+        self.retention_frame.grid(row=5, column=0, pady=10, padx=20, sticky="ew")
+        self.retention_frame.grid_columnconfigure(1, weight=1)
+
+        self.retention_label = ctk.CTkLabel(
+            self.retention_frame,
+            text="Хранить историю:",
+            font=ctk.CTkFont(size=14)
+        )
+        self.retention_label.grid(row=0, column=0, pady=15, padx=15, sticky="w")
+
+        self.retention_options = {"24 часа": 24, "7 дней": 168, "30 дней": 720, "Бессрочно": 0}
+        self.retention_names = list(self.retention_options.keys())
+        self.retention_dropdown = ctk.CTkComboBox(
+            self.retention_frame,
+            values=self.retention_names,
+            width=280,
+            state="readonly"
+        )
+        self.retention_dropdown.grid(row=0, column=1, pady=15, padx=15, sticky="ew")
+        self._set_retention_selection()
+
         # Save button
         self.save_btn = ctk.CTkButton(
             self,
@@ -315,6 +338,12 @@ class SettingsWindow(ctk.CTkToplevel):
                     self.mic_dropdown.set(self.mic_names[i])
                     return
             self.mic_dropdown.set(self.mic_names[0])
+
+    def _set_retention_selection(self):
+        """Select the current history-retention option from settings."""
+        cur = self.settings.get('history_retention_hours', 24)
+        name = next((n for n, h in self.retention_options.items() if h == cur), "24 часа")
+        self.retention_dropdown.set(name)
 
     def _load_microphones(self):
         """Load available microphones"""
@@ -524,6 +553,10 @@ class SettingsWindow(ctk.CTkToplevel):
         self.settings['language_code'] = self.language_options.get(selected_lang, None)
         self.settings['language_name'] = selected_lang
 
+        # Save history retention
+        selected_retention = self.retention_dropdown.get()
+        self.settings['history_retention_hours'] = self.retention_options.get(selected_retention, 24)
+
         # Hotkey is already saved in self.settings during recording
 
         save_settings(self.settings)
@@ -561,6 +594,9 @@ class SettingsWindow(ctk.CTkToplevel):
                 lang_name = name
                 break
         self.lang_dropdown.set(lang_name)
+
+        # Update retention display
+        self._set_retention_selection()
 
         self._refresh_microphones()
         self.deiconify()

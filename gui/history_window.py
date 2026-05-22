@@ -4,6 +4,7 @@ History Window - Shows recording history with copy functionality
 import os
 import sys
 import tkinter as tk
+from tkinter import filedialog
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -61,10 +62,10 @@ class HistoryWindow(ctk.CTkToplevel):
 
         self.title_label = ctk.CTkLabel(
             self.header_frame,
-            text="История записей (последние 24 часа)",
+            text="История записей",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        self.title_label.grid(row=0, column=0, sticky="w", padx=10, pady=10)
+        self.title_label.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 5))
 
         self.refresh_btn = ctk.CTkButton(
             self.header_frame,
@@ -72,7 +73,23 @@ class HistoryWindow(ctk.CTkToplevel):
             width=100,
             command=self.refresh_list
         )
-        self.refresh_btn.grid(row=0, column=1, padx=10, pady=10)
+        self.refresh_btn.grid(row=0, column=1, padx=10, pady=(10, 5))
+
+        # Search + export row
+        self.search_entry = ctk.CTkEntry(
+            self.header_frame,
+            placeholder_text="Поиск по тексту…"
+        )
+        self.search_entry.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.search_entry.bind("<KeyRelease>", lambda e: self.refresh_list())
+
+        self.export_btn = ctk.CTkButton(
+            self.header_frame,
+            text="Экспорт",
+            width=100,
+            command=self._export
+        )
+        self.export_btn.grid(row=1, column=1, padx=10, pady=(0, 10))
 
         # Scrollable frame for recordings
         self.scroll_frame = ctk.CTkScrollableFrame(self)
@@ -99,13 +116,17 @@ class HistoryWindow(ctk.CTkToplevel):
         for widget in self.scroll_frame.winfo_children():
             widget.destroy()
 
-        # Get recordings from database
-        recordings = self.db.get_recent_recordings(limit=100)
+        # Get recordings from database (search if there's a query)
+        query = self.search_entry.get().strip() if hasattr(self, 'search_entry') else ""
+        if query:
+            recordings = self.db.search_recordings(query, limit=300)
+        else:
+            recordings = self.db.get_recent_recordings(limit=300)
 
         if not recordings:
             no_data_label = ctk.CTkLabel(
                 self.scroll_frame,
-                text="Нет записей за последние 24 часа",
+                text="Ничего не найдено" if query else "Нет записей",
                 font=ctk.CTkFont(size=14)
             )
             no_data_label.grid(row=0, column=0, pady=50)
@@ -116,7 +137,8 @@ class HistoryWindow(ctk.CTkToplevel):
         for i, recording in enumerate(recordings):
             self._create_recording_item(i, recording)
 
-        self.status_label.configure(text=f"{len(recordings)} записей")
+        suffix = f" по запросу «{query}»" if query else ""
+        self.status_label.configure(text=f"{len(recordings)} записей{suffix}")
 
     def _create_recording_item(self, index: int, recording: dict):
         """Create a single recording item widget"""
@@ -129,15 +151,15 @@ class HistoryWindow(ctk.CTkToplevel):
         # Time label
         try:
             created_at = datetime.fromisoformat(recording['created_at'])
-            time_str = created_at.strftime("%H:%M:%S")
+            time_str = created_at.strftime("%d.%m %H:%M")
         except (ValueError, TypeError):
-            time_str = "??:??:??"
+            time_str = "??:??"
 
         time_label = ctk.CTkLabel(
             frame,
             text=time_str,
             font=ctk.CTkFont(size=11),
-            width=70
+            width=90
         )
         time_label.grid(row=0, column=0, padx=(10, 5), pady=8, sticky="n" if is_latest else "")
 
@@ -170,6 +192,39 @@ class HistoryWindow(ctk.CTkToplevel):
             command=lambda t=text: self._copy_text(t)
         )
         copy_btn.grid(row=0, column=2, padx=10, pady=8, sticky="n" if is_latest else "")
+
+    def _export(self):
+        """Export all stored recordings to a .md or .txt file."""
+        recordings = self.db.get_all_recordings(limit=10000)
+        if not recordings:
+            self.status_label.configure(text="Нечего экспортировать")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            defaultextension=".md",
+            filetypes=[("Markdown", "*.md"), ("Text", "*.txt")],
+            initialfile=f"voicedrop_history_{datetime.now():%Y%m%d_%H%M}.md",
+        )
+        if not path:
+            return
+        is_md = path.lower().endswith(".md")
+        try:
+            blocks = []
+            for r in recordings:
+                ts = r.get('created_at', '')
+                try:
+                    ts = datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M:%S")
+                except (ValueError, TypeError):
+                    pass
+                text = r.get('text', '')
+                blocks.append(f"### {ts}\n\n{text}\n" if is_md else f"[{ts}]\n{text}\n")
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(blocks))
+            self.status_label.configure(
+                text=f"Экспортировано {len(recordings)} → {os.path.basename(path)}"
+            )
+        except Exception as e:
+            self.status_label.configure(text=f"Ошибка экспорта: {e}")
 
     def _copy_text(self, text: str):
         """Copy text to clipboard"""
