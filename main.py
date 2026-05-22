@@ -14,7 +14,16 @@ from typing import Optional
 from datetime import datetime
 
 # Setup file logging FIRST to capture all events
-LOG_FILE = os.path.join(os.path.dirname(__file__), 'voicedrop.log')
+def get_app_dir():
+    """Get application directory that works for both development and PyInstaller"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(__file__)
+
+APP_DIR = get_app_dir()
+LOG_FILE = os.path.join(APP_DIR, 'voicedrop.log')
+CRASH_LOG_FILE = os.path.join(APP_DIR, 'voicedrop_crash.log')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -24,16 +33,57 @@ logging.basicConfig(
     ]
 )
 
+
+# --- Global crash handlers ---------------------------------------------------
+# Real crashes used to vanish without a trace: all tracebacks in voicedrop.log
+# came from the caught network errors in _process_audio, while uncaught failures
+# in daemon threads (hotkey callbacks, pystray) or native code died silently.
+# These hooks make every uncaught exception land in voicedrop_crash.log.
+def _write_crash(kind: str, exc_type, exc_value, exc_tb, thread_name: str = ""):
+    import traceback
+    tb_text = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    where = f" in thread '{thread_name}'" if thread_name else ""
+    header = f"{kind}{where}: {getattr(exc_type, '__name__', exc_type)}: {exc_value}"
+    logging.critical("%s\n%s", header, tb_text)
+    try:
+        with open(CRASH_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'=' * 70}\n{datetime.now().isoformat()}  {header}\n{tb_text}")
+    except Exception:
+        pass  # never let crash logging itself crash
+
+
+def _sys_excepthook(exc_type, exc_value, exc_tb):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    _write_crash("UNCAUGHT EXCEPTION (main thread)", exc_type, exc_value, exc_tb)
+
+
+def _thread_excepthook(args):
+    if issubclass(args.exc_type, SystemExit):
+        return
+    thread_name = getattr(args.thread, 'name', '') if args.thread else ''
+    _write_crash("UNCAUGHT EXCEPTION (thread)",
+                 args.exc_type, args.exc_value, args.exc_traceback, thread_name)
+
+
+sys.excepthook = _sys_excepthook
+threading.excepthook = _thread_excepthook
+logging.info("Global crash handlers installed (crash log: %s)", CRASH_LOG_FILE)
+# ----------------------------------------------------------------------------
+
 # Fix Windows console encoding for Russian text
 if sys.platform == 'win32':
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    if sys.stdout is not None:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if sys.stderr is not None:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
     import ctypes
 
     # Single instance check using Windows mutex
     # Use full path to make mutex unique to this installation
-    MUTEX_NAME = f"Global\\VoiceDrop_{os.path.abspath(__file__).replace(':', '').replace('\\', '_')}"
+    MUTEX_NAME = f"Global\\VoiceDrop_{os.path.abspath(APP_DIR).replace(':', '').replace('\\', '_')}"
 
     # Create mutex and store as GLOBAL variable to prevent garbage collection
     _APP_MUTEX = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
@@ -67,8 +117,18 @@ from core.hotkey_manager import HotkeyManager
 from core.text_inserter import TextInserter
 from gui.history_window import HistoryWindow
 from gui.recording_overlay import RecordingOverlay
-from gui.settings_window import SettingsWindow, load_settings
+from gui.settings_window import SettingsWindow, load_settings, save_settings
 from gui.tray_icon import TrayIcon
+
+
+# Don't mute other apps for ultra-short presses (they become "too short" anyway).
+# This kills the mute/unmute churn that flaps other apps' audio on quick taps.
+_MUTE_GRACE_SEC = 0.18
+# Suppress stacked start-beeps when the hotkey is tapped rapidly.
+_START_BEEP_MIN_GAP_SEC = 0.25
+
+# Display name per language code (None = auto-detect) for the tray quick-toggle.
+_LANGUAGE_NAMES = {None: "Автоопределение", "ru": "Русский", "uk": "Українська", "en": "English"}
 
 
 class VoiceDropApp:
@@ -89,6 +149,10 @@ class VoiceDropApp:
         self._is_recording = False
         self._lock = threading.Lock()
         self._is_shutting_down = False
+        # Monotonic id per record session — lets a late/slow mute detect that its
+        # recording already ended and undo itself, preventing "stuck muted" audio.
+        self._record_session_id = 0
+        self._last_start_beep = 0.0
 
         # Force unmute all audio on startup (in case previous instance crashed)
         logging.info("Force unmuting all audio on startup...")
@@ -115,61 +179,141 @@ class VoiceDropApp:
         self._on_quit()
 
     def _on_hotkey_press(self):
-        """Called when hotkey is pressed - start recording"""
-        with self._lock:
-            if self._is_recording:
+        """Called when hotkey is pressed - start recording.
+
+        Capture starts FIRST so muting (slow pycaw/COM) can never delay or eat
+        the recording. Muting runs in a background, race-guarded worker.
+        """
+        try:
+            with self._lock:
+                if self._is_recording:
+                    return
+                self._is_recording = True
+                self._record_session_id += 1
+                session_id = self._record_session_id
+
+            logging.info("Recording started...")
+
+            # Audio cue first (kept out of the captured audio), then capture.
+            # Rate-limited so rapid taps don't stack beeps into noise.
+            now = time.time()
+            if now - self._last_start_beep > _START_BEEP_MIN_GAP_SEC:
+                self._last_start_beep = now
+                winsound.Beep(600, 50)
+
+            # 1) START CAPTURE IMMEDIATELY — no blocking work before this.
+            try:
+                self.audio_recorder.start_recording()
+            except Exception as e:
+                logging.error(f"Failed to start recording: {e}", exc_info=True)
+                with self._lock:
+                    self._is_recording = False
+                # Make sure we never leave the system muted or the UI stuck.
+                try:
+                    self.audio_muter.unmute_all()
+                except Exception:
+                    pass
+                if self.tray_icon:
+                    self.tray_icon.set_recording(False)
+                    self.tray_icon.show_notification("VoiceDrop — микрофон", str(e))
+                if self.recording_overlay and self._root:
+                    self._root.after(0, self.recording_overlay.hide)
+                winsound.Beep(300, 200)  # error cue
                 return
-            self._is_recording = True
 
-        logging.info("Recording started...")
+            # 2) UI feedback.
+            if self.tray_icon:
+                self.tray_icon.set_recording(True)
+            if self._root and self.recording_overlay:
+                self._root.after(0, lambda: self.recording_overlay.show(self._root))
 
-        # Play start recording sound (before muting)
-        winsound.Beep(600, 50)
+            # 3) Mute other apps in the background (best-effort, race-guarded).
+            threading.Thread(
+                target=self._mute_worker, args=(session_id,), daemon=True
+            ).start()
+        except Exception as e:
+            logging.error(f"Unexpected error in _on_hotkey_press: {e}", exc_info=True)
+            with self._lock:
+                self._is_recording = False
 
-        # Mute all system audio
-        self.audio_muter.mute_all()
+    def _mute_worker(self, session_id: int):
+        """Mute other audio sessions for a given record session.
 
-        if self.tray_icon:
-            self.tray_icon.set_recording(True)
-
-        # Show recording overlay
-        if self._root and self.recording_overlay:
-            self._root.after(0, lambda: self.recording_overlay.show(self._root))
-
-        self.audio_recorder.start_recording()
+        If the recording already ended (or a newer one started) by the time the
+        mute completes, undo it — this is what prevents audio getting stuck muted
+        when pycaw's COM call is slow and lands after release.
+        """
+        # Grace period: a quick tap ends within this window and never mutes,
+        # so other apps' audio doesn't flap on accidental / too-short presses.
+        time.sleep(_MUTE_GRACE_SEC)
+        with self._lock:
+            if not (self._is_recording and session_id == self._record_session_id):
+                return  # released before muting even began (or a newer session started)
+        try:
+            self.audio_muter.mute_all()
+        except Exception as e:
+            logging.error(f"mute_all failed: {e}", exc_info=True)
+            return
+        with self._lock:
+            still_active = self._is_recording and session_id == self._record_session_id
+        if not still_active:
+            try:
+                self.audio_muter.unmute_all()
+                logging.info("Mute landed after release; auto-unmuted (race guard)")
+            except Exception as e:
+                logging.error(f"race-guard unmute failed: {e}", exc_info=True)
 
     def _on_hotkey_release(self):
-        """Called when hotkey is released - stop recording and process"""
-        with self._lock:
-            if not self._is_recording:
+        """Called when hotkey is released - stop recording and process."""
+        try:
+            with self._lock:
+                if not self._is_recording:
+                    return
+                self._is_recording = False
+
+            logging.info("Recording stopped, processing...")
+
+            # Unmute always wins. If a late mute_worker lands after this, its own
+            # race guard will detect the ended session and unmute again.
+            try:
+                self.audio_muter.unmute_all()
+            except Exception as e:
+                logging.error(f"unmute_all failed: {e}", exc_info=True)
+
+            if self.tray_icon:
+                self.tray_icon.set_recording(False)
+
+            # Show processing state on overlay
+            if self.recording_overlay and self._root:
+                self._root.after(0, self.recording_overlay.show_processing)
+
+            # Stop recording
+            try:
+                audio_data, duration_ms = self.audio_recorder.stop_recording()
+            except Exception as e:
+                logging.error(f"stop_recording failed: {e}", exc_info=True)
+                if self.recording_overlay and self._root:
+                    self._root.after(0, self.recording_overlay.hide)
                 return
-            self._is_recording = False
 
-        logging.info("Recording stopped, processing...")
+            if not audio_data or duration_ms < 200:  # Too short
+                logging.info("Recording too short, ignoring")
+                if self.recording_overlay and self._root:
+                    self._root.after(0, self.recording_overlay.hide)
+                return
 
-        # Unmute all system audio
-        self.audio_muter.unmute_all()
-
-        if self.tray_icon:
-            self.tray_icon.set_recording(False)
-
-        # Show processing state on overlay
-        if self.recording_overlay:
-            self._root.after(0, self.recording_overlay.show_processing)
-
-        # Stop recording
-        audio_data, duration_ms = self.audio_recorder.stop_recording()
-
-        if not audio_data or duration_ms < 200:  # Too short
-            logging.info("Recording too short, ignoring")
-            return
-
-        # Process in background thread
-        threading.Thread(
-            target=self._process_audio,
-            args=(audio_data, duration_ms),
-            daemon=True
-        ).start()
+            # Process in background thread
+            threading.Thread(
+                target=self._process_audio,
+                args=(audio_data, duration_ms),
+                daemon=True
+            ).start()
+        except Exception as e:
+            logging.error(f"Unexpected error in _on_hotkey_release: {e}", exc_info=True)
+            try:
+                self.audio_muter.unmute_all()
+            except Exception:
+                pass
 
     def _process_audio(self, audio_data: bytes, duration_ms: int):
         """Process audio: transcribe and insert text"""
@@ -230,11 +374,17 @@ class VoiceDropApp:
         """Apply saved settings on startup"""
         settings = load_settings()
 
-        # Apply microphone setting
+        # Apply microphone setting (resolved BY NAME at capture time)
         mic_id = settings.get('microphone_id')
-        if mic_id is not None:
-            self.audio_recorder.set_device(mic_id)
-            logging.info(f"Using microphone: {settings.get('microphone_name', mic_id)}")
+        mic_name = settings.get('microphone_name')
+        mic_hostapi = settings.get('microphone_hostapi')
+        if mic_name or mic_id is not None:
+            self.audio_recorder.set_device(mic_id, mic_name, mic_hostapi)
+            idx, detail = self.audio_recorder.resolve_device_index()
+            if idx is None and mic_name:
+                logging.warning(f"Configured microphone NOT found at startup: {detail}")
+            else:
+                logging.info(f"Microphone configured -> {detail}")
 
         # Return hotkey VK codes for initialization
         hotkey = settings.get('hotkey')
@@ -244,17 +394,38 @@ class VoiceDropApp:
 
     def _on_settings_changed(self, settings: dict):
         """Called when settings are changed"""
-        # Apply microphone setting
+        # Apply microphone setting (resolved BY NAME at capture time)
         mic_id = settings.get('microphone_id')
-        if mic_id is not None:
-            self.audio_recorder.set_device(mic_id)
-            logging.info(f"Microphone changed to: {settings.get('microphone_name', mic_id)}")
+        mic_name = settings.get('microphone_name')
+        mic_hostapi = settings.get('microphone_hostapi')
+        if mic_name or mic_id is not None:
+            self.audio_recorder.set_device(mic_id, mic_name, mic_hostapi)
+            idx, detail = self.audio_recorder.resolve_device_index()
+            if idx is None and mic_name:
+                logging.warning(f"Configured microphone NOT found: {detail}")
+            else:
+                logging.info(f"Microphone changed -> {detail}")
 
         # Apply hotkey setting
         hotkey = settings.get('hotkey')
         if hotkey and 'keys' in hotkey and self.hotkey_manager:
             self.hotkey_manager.set_hotkey(hotkey['keys'])
             logging.info(f"Hotkey changed to: {hotkey.get('display', 'Unknown')}")
+
+    def _get_language(self) -> Optional[str]:
+        """Current language code from settings (None = auto). Used by the tray menu."""
+        return load_settings().get('language_code')
+
+    def _set_language(self, code: Optional[str]):
+        """Quick-set recognition language from the tray; applies to the next recording."""
+        settings = load_settings()
+        settings['language_code'] = code
+        name = _LANGUAGE_NAMES.get(code, "Автоопределение")
+        settings['language_name'] = name
+        save_settings(settings)
+        logging.info(f"Language set via tray -> {name} ({code})")
+        if self.tray_icon:
+            self.tray_icon.show_notification("VoiceDrop — язык", f"Язык распознавания: {name}")
 
     def _show_history(self):
         """Show history window"""
@@ -361,7 +532,7 @@ class VoiceDropApp:
         self._root.withdraw()  # Hide root window
 
         # Set icon for root window (will be inherited by child windows)
-        icon_path = os.path.join(os.path.dirname(__file__), 'assets', 'icon.ico')
+        icon_path = os.path.join(APP_DIR, 'assets', 'icon.ico')
         if os.path.exists(icon_path):
             self._root.iconbitmap(icon_path)
 
@@ -389,7 +560,9 @@ class VoiceDropApp:
         self.tray_icon = TrayIcon(
             on_show_history=self._show_history,
             on_quit=self._on_quit,
-            on_settings=self._show_settings
+            on_settings=self._show_settings,
+            on_set_language=self._set_language,
+            get_language=self._get_language
         )
 
         # Run tray icon in separate thread (it blocks)

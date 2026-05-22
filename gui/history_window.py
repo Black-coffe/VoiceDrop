@@ -2,16 +2,25 @@
 History Window - Shows recording history with copy functionality
 """
 import os
+import sys
 import tkinter as tk
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Optional
 
 import customtkinter as ctk
 
 from core.db_manager import DatabaseManager
 
+def get_app_dir():
+    """Get application directory that works for both development and PyInstaller"""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    else:
+        return Path(__file__).parent.parent
+
 # Get icon path
-ICON_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'assets', 'icon.ico')
+ICON_PATH = str(get_app_dir() / 'assets' / 'icon.ico')
 
 
 class HistoryWindow(ctk.CTkToplevel):

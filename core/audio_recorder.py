@@ -2,6 +2,7 @@
 Audio Recorder - Captures audio from microphone
 """
 import io
+import logging
 import threading
 import time
 from typing import Optional, Callable
@@ -11,6 +12,15 @@ import sounddevice as sd
 import soundfile as sf
 
 from config import SAMPLE_RATE, CHANNELS
+
+# When one physical mic is exposed under several host APIs, prefer them in this
+# order. MME first = same device VoiceDrop has always opened, and most stable.
+_HOSTAPI_PRIORITY = {
+    'MME': 0,
+    'Windows WASAPI': 1,
+    'Windows DirectSound': 2,
+    'Windows WDM-KS': 3,
+}
 
 
 class AudioRecorder:
@@ -22,6 +32,10 @@ class AudioRecorder:
         self._lock = threading.Lock()
         self._stream: Optional[sd.InputStream] = None
         self._start_time: float = 0
+        # The mic is identified BY NAME (Windows device indices are unstable).
+        # _device_id is only a legacy hint used when no name is configured.
+        self._device_name: Optional[str] = None
+        self._device_hostapi: Optional[str] = None
         self._device_id: Optional[int] = None  # None = use system default
 
         # Real-time audio level for visualization
@@ -57,7 +71,13 @@ class AudioRecorder:
         return 0.0
 
     def start_recording(self):
-        """Start recording audio"""
+        """Start recording audio from the configured mic (resolved BY NAME).
+
+        Raises RuntimeError if a specific microphone was configured but is not
+        currently present — we never silently fall back to the system default.
+        """
+        device_index = self._resolve_device_for_capture()
+
         with self._lock:
             self._frames = []
             self.is_recording = True
@@ -66,15 +86,22 @@ class AudioRecorder:
         with self._level_lock:
             self._current_level = 0.0
 
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype=np.float32,
-            callback=self._audio_callback,
-            blocksize=1024,
-            device=self._device_id  # Use selected microphone
-        )
-        self._stream.start()
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype=np.float32,
+                callback=self._audio_callback,
+                blocksize=1024,
+                device=device_index
+            )
+            self._stream.start()
+        except Exception:
+            # Roll back so a failed open can't wedge the recording state.
+            with self._lock:
+                self.is_recording = False
+            self._stream = None
+            raise
 
     def stop_recording(self) -> tuple[bytes, int]:
         """Stop recording and return audio data as WAV bytes and duration in ms"""
@@ -101,19 +128,93 @@ class AudioRecorder:
         return buffer.read(), duration_ms
 
     def get_available_devices(self) -> list[dict]:
-        """Get list of available input devices"""
+        """Get list of available input devices (with host API name)."""
         devices = sd.query_devices()
+        try:
+            hostapis = sd.query_hostapis()
+        except Exception:
+            hostapis = []
         input_devices = []
         for i, device in enumerate(devices):
             if device['max_input_channels'] > 0:
+                try:
+                    hostapi = hostapis[device['hostapi']]['name']
+                except Exception:
+                    hostapi = ''
                 input_devices.append({
                     'id': i,
                     'name': device['name'],
+                    'hostapi': hostapi,
                     'channels': device['max_input_channels'],
                     'default': i == sd.default.device[0]
                 })
         return input_devices
 
-    def set_device(self, device_id: Optional[int]):
-        """Set the input device"""
+    def set_device(self, device_id: Optional[int] = None, device_name: Optional[str] = None,
+                   device_hostapi: Optional[str] = None):
+        """Configure the input device.
+
+        Prefer device_name — it survives the index reshuffling that happens on
+        Windows when devices are added/removed. device_id is kept only as a
+        legacy hint for when no name is available.
+        """
         self._device_id = device_id
+        self._device_name = device_name
+        self._device_hostapi = device_hostapi
+
+    def resolve_device_index(self) -> tuple[Optional[int], str]:
+        """Resolve the configured microphone to a CURRENT device index, BY NAME.
+
+        Returns (index, detail). index is None when nothing usable was resolved.
+        Never silently substitutes the system default for a configured mic.
+        """
+        name = self._device_name
+        if not name:
+            if self._device_id is not None:
+                return self._device_id, f"index #{self._device_id} (no name configured)"
+            return None, "system default (no microphone configured)"
+
+        try:
+            devices = sd.query_devices()
+            hostapis = sd.query_hostapis()
+        except Exception as e:
+            return None, f"query_devices failed: {e}"
+
+        def hostapi_name(dev) -> str:
+            try:
+                return hostapis[dev['hostapi']]['name']
+            except Exception:
+                return '?'
+
+        # Exact name match among input devices; fall back to prefix match to
+        # tolerate host-API suffixes / MME's 31-char name truncation.
+        matches = [i for i, d in enumerate(devices)
+                   if d['max_input_channels'] > 0 and d['name'] == name]
+        if not matches:
+            matches = [i for i, d in enumerate(devices)
+                       if d['max_input_channels'] > 0
+                       and (d['name'].startswith(name) or name.startswith(d['name']))]
+
+        if not matches:
+            return None, f"'{name}' not found among current input devices"
+
+        # Prefer the exact host API the user picked; else the priority order.
+        def rank(i: int) -> tuple:
+            ha = hostapi_name(devices[i])
+            picked = 0 if (self._device_hostapi and ha == self._device_hostapi) else 1
+            return (picked, _HOSTAPI_PRIORITY.get(ha, 99), i)
+
+        matches.sort(key=rank)
+        idx = matches[0]
+        return idx, f"{devices[idx]['name']} [#{idx}, {hostapi_name(devices[idx])}]"
+
+    def _resolve_device_for_capture(self) -> Optional[int]:
+        """Return the device index to open, or raise if a configured mic is gone."""
+        idx, detail = self.resolve_device_index()
+        if idx is None and self._device_name:
+            raise RuntimeError(
+                f"Микрофон «{self._device_name}» не найден. "
+                f"Проверьте подключение или выберите микрофон в настройках."
+            )
+        logging.info(f"Opening microphone: {detail}")
+        return idx

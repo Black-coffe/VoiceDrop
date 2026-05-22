@@ -3,6 +3,7 @@ Settings Window - Application settings including microphone and hotkey configura
 """
 import json
 import os
+import sys
 import tkinter as tk
 from pathlib import Path
 from typing import Callable, Optional, Set
@@ -14,8 +15,16 @@ from pynput import keyboard
 from core.audio_recorder import AudioRecorder
 
 
-SETTINGS_FILE = Path(__file__).parent.parent / "settings.json"
-ICON_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'assets', 'icon.ico')
+def get_app_dir():
+    """Get application directory that works for both development and PyInstaller"""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    else:
+        return Path(__file__).parent.parent
+
+APP_DIR = get_app_dir()
+SETTINGS_FILE = APP_DIR / "settings.json"
+ICON_PATH = str(APP_DIR / 'assets' / 'icon.ico')
 
 # Default hotkey: Ctrl + Shift + Space
 DEFAULT_HOTKEY = {
@@ -74,9 +83,18 @@ def load_settings() -> dict:
 
 
 def save_settings(settings: dict):
-    """Save settings to file"""
-    with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+    """Save settings to file atomically (temp file + os.replace).
+
+    Atomic write stops a concurrent reader (e.g. the tray re-rendering its
+    language radio while we save) from seeing a half-written file, falling back
+    to defaults, and showing two language items checked at once.
+    """
+    tmp = SETTINGS_FILE.parent / (SETTINGS_FILE.name + '.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, SETTINGS_FILE)
 
 
 class SettingsWindow(ctk.CTkToplevel):
@@ -266,14 +284,31 @@ class SettingsWindow(ctk.CTkToplevel):
         self.protocol("WM_DELETE_WINDOW", self.hide)
 
     def _set_current_microphone(self):
-        """Set dropdown to current microphone from settings"""
-        current_mic_id = self.settings.get('microphone_id')
-        if current_mic_id is not None:
+        """Set dropdown to current microphone from settings (match BY NAME)."""
+        current_name = self.settings.get('microphone_name')
+        current_hostapi = self.settings.get('microphone_hostapi')
+        current_id = self.settings.get('microphone_id')
+
+        # 1) exact name + host API (most precise)
+        if current_name:
             for i, mic in enumerate(self.microphones):
-                if mic['id'] == current_mic_id:
+                if mic['name'] == current_name and (
+                    not current_hostapi or mic.get('hostapi') == current_hostapi
+                ):
                     self.mic_dropdown.set(self.mic_names[i])
                     return
-        # Select default microphone
+            # 2) name only
+            for i, mic in enumerate(self.microphones):
+                if mic['name'] == current_name:
+                    self.mic_dropdown.set(self.mic_names[i])
+                    return
+        # 3) legacy id hint
+        if current_id is not None:
+            for i, mic in enumerate(self.microphones):
+                if mic['id'] == current_id:
+                    self.mic_dropdown.set(self.mic_names[i])
+                    return
+        # 4) system default
         if self.mic_names:
             for i, mic in enumerate(self.microphones):
                 if mic.get('default'):
@@ -292,6 +327,9 @@ class SettingsWindow(ctk.CTkToplevel):
         self.mic_names = []
         for mic in self.microphones:
             name = mic['name']
+            ha = mic.get('hostapi')
+            if ha:
+                name += f" [{ha}]"  # disambiguate the same mic across host APIs
             if mic.get('default'):
                 name += " (по умолчанию)"
             self.mic_names.append(name)
@@ -479,6 +517,7 @@ class SettingsWindow(ctk.CTkToplevel):
         if selected_idx >= 0 and selected_idx < len(self.microphones):
             self.settings['microphone_id'] = self.microphones[selected_idx]['id']
             self.settings['microphone_name'] = self.microphones[selected_idx]['name']
+            self.settings['microphone_hostapi'] = self.microphones[selected_idx].get('hostapi')
 
         # Save language
         selected_lang = self.lang_dropdown.get()

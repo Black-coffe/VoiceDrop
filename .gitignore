@@ -18,5 +18,10 @@ settings.json
 # Log files
 *.log
 
+# PyInstaller build output
+build/
+dist/
+*.spec.bak
+
 # Claude Code
 .claude/
