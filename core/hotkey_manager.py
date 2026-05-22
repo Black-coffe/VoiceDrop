@@ -31,7 +31,8 @@ class HotkeyManager:
         self,
         on_press_callback: Callable[[], None],
         on_release_callback: Callable[[], None],
-        hotkey_vks: Optional[Set[int]] = None
+        hotkey_vks: Optional[Set[int]] = None,
+        modifier_vks: Optional[Set[int]] = None
     ):
         """
         Initialize hotkey manager
@@ -40,13 +41,18 @@ class HotkeyManager:
             on_press_callback: Called when hotkey is pressed
             on_release_callback: Called when hotkey is released
             hotkey_vks: Set of virtual key codes for hotkey
+            modifier_vks: Extra "mode" keys; if any are held during the active
+                window, modifier_was_held() returns True (e.g. Right Shift =
+                dictate this clip in code mode). Not part of the trigger itself.
         """
         self.on_press_callback = on_press_callback
         self.on_release_callback = on_release_callback
         self.hotkey_vks = hotkey_vks or DEFAULT_HOTKEY_VKS.copy()
+        self._modifier_vks: Set[int] = set(modifier_vks) if modifier_vks else set()
 
         self._current_vks: Set[int] = set()
         self._is_hotkey_active = False
+        self._modifier_latched = False  # was a modifier key held during this activation
         self._listener: Optional[keyboard.Listener] = None
         self._lock = threading.Lock()
 
@@ -129,8 +135,13 @@ class HotkeyManager:
             # Check if hotkey combination is pressed
             if not self._is_hotkey_active and self._check_hotkey_match():
                 self._is_hotkey_active = True
+                # Latch whether a "mode" modifier is already held at activation
+                self._modifier_latched = bool(self._modifier_vks & self._current_vks)
                 # Run callback in separate thread to not block listener
                 threading.Thread(target=self.on_press_callback, daemon=True).start()
+            elif self._is_hotkey_active and vk in self._modifier_vks:
+                # Modifier added mid-recording -> latch it for this clip
+                self._modifier_latched = True
 
     def _on_release(self, key):
         """Handle key release"""
@@ -174,6 +185,10 @@ class HotkeyManager:
     def is_running(self) -> bool:
         """Check if listener is running"""
         return self._listener is not None and self._listener.is_alive()
+
+    def modifier_was_held(self) -> bool:
+        """True if a mode-modifier key was held during the current/last activation."""
+        return self._modifier_latched
 
     def set_hotkey(self, vk_codes: List[int]):
         """Update hotkey combination using VK codes"""

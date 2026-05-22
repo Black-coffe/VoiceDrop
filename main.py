@@ -176,6 +176,12 @@ class VoiceDropApp:
         # Load saved settings and get hotkey VK codes
         self._saved_hotkey_vks = self._apply_saved_settings()
 
+        # "Code mode" modifier: hold it WITH the hotkey to dictate this clip raw
+        # (no polish). Default Right Shift (161); ignored if it's part of the hotkey.
+        _cm = load_settings().get('code_modifier', 161)
+        _primary = self._saved_hotkey_vks or set()
+        self._code_modifier_vks = {_cm} if (_cm and _cm not in _primary) else set()
+
         # Background scheduler for cleanup
         self.scheduler = BackgroundScheduler()
         self.scheduler.add_job(self.db.cleanup_old_recordings, 'interval', hours=1)
@@ -322,10 +328,14 @@ class VoiceDropApp:
                     self._root.after(0, self.recording_overlay.hide)
                 return
 
+            # Code-mode modifier (e.g. Right Shift) held with the hotkey -> raw
+            forced_mode = "code" if (self.hotkey_manager and
+                                     self.hotkey_manager.modifier_was_held()) else None
+
             # Process in background thread
             threading.Thread(
                 target=self._process_audio,
-                args=(audio_data, duration_ms),
+                args=(audio_data, duration_ms, forced_mode),
                 daemon=True
             ).start()
         except Exception as e:
@@ -335,7 +345,7 @@ class VoiceDropApp:
             except Exception:
                 pass
 
-    def _process_audio(self, audio_data: bytes, duration_ms: int):
+    def _process_audio(self, audio_data: bytes, duration_ms: int, forced_mode: Optional[str] = None):
         """Process audio: transcribe and insert text"""
         # Keep this clip so it can be re-transcribed in another language later.
         self._last_audio_data = audio_data
@@ -362,8 +372,10 @@ class VoiceDropApp:
 
             text = text.strip()
 
-            # Resolve dictation mode (auto by foreground app, or forced text/code)
-            mode = self._effective_mode()
+            # Resolve dictation mode: hotkey modifier forces code, else the setting
+            mode = forced_mode or self._effective_mode()
+            if forced_mode == "code":
+                logging.info("Code-mode modifier held -> raw (no polish) for this clip")
 
             # Optional LLM polish — text mode only (code mode stays verbatim).
             # Best-effort: returns original on error.
@@ -778,7 +790,8 @@ class VoiceDropApp:
         self.hotkey_manager = HotkeyManager(
             on_press_callback=self._on_hotkey_press,
             on_release_callback=self._on_hotkey_release,
-            hotkey_vks=self._saved_hotkey_vks
+            hotkey_vks=self._saved_hotkey_vks,
+            modifier_vks=self._code_modifier_vks
         )
         self.hotkey_manager.start()
 
