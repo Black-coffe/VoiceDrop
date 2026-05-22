@@ -8,12 +8,31 @@ retried with exponential backoff (honoring Retry-After); validation/auth errors
 are not retried.
 """
 import logging
+import re
 import time
 from typing import Optional
 
 import httpx
 
 from config import ELEVENLABS_API_KEY, ELEVENLABS_STT_URL
+
+# scribe_v1 tags non-speech sounds as parentheticals like "(смеётся)", "(тишина)".
+# We disable them at source via tag_audio_events=false; this strips any residue
+# (only parentheses that contain a known audio-event word, so real text is safe).
+_AUDIO_EVENT_RE = re.compile(
+    r"\s*\([^)]*?(?:смеёт|смеет|смех|хохот|кашл|вздыха|вздох|тишина|молчан|музык|"
+    r"аплодисм|шум|шёпот|шепот|laugh|cough|sigh|silence|music|applause|noise|"
+    r"whisper|breath)[^)]*?\)",
+    re.IGNORECASE,
+)
+
+
+def _strip_audio_events(text: str) -> str:
+    if not text:
+        return text
+    text = _AUDIO_EVENT_RE.sub("", text)
+    text = re.sub(r"[ ]{2,}", " ", text)
+    return text.strip()
 
 # HTTP statuses worth retrying (transient server-side / rate limiting).
 _RETRY_STATUS = {429, 500, 502, 503, 504}
@@ -73,7 +92,8 @@ class ElevenLabsClient:
 
         client = self._get_client()
         headers = {"xi-api-key": self.api_key}
-        data = {"model_id": "scribe_v1"}
+        # tag_audio_events=false: don't emit "(laughs)"/"(тишина)" non-speech tags.
+        data = {"model_id": "scribe_v1", "tag_audio_events": "false"}
         # Only pin the language if specified (otherwise scribe_v1 auto-detects).
         if language:
             data["language_code"] = language
@@ -108,7 +128,7 @@ class ElevenLabsClient:
                 logging.warning(f"HTTP error, attempt {attempt + 1}: {e}")
             else:
                 if response.status_code == 200:
-                    return response.json().get("text", "")
+                    return _strip_audio_events(response.json().get("text", ""))
 
                 is_retryable_status = response.status_code in _RETRY_STATUS
 

@@ -15,6 +15,7 @@ __pycache__/
 *.db
 settings.json
 replacements.json
+commands.json
 pending/
 
 # Log files
