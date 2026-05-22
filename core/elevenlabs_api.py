@@ -1,10 +1,42 @@
 """
 ElevenLabs API Client - Speech to Text
+
+Resilient against the real-world failures seen in the field:
+429 system_busy, 5xx, read/write timeouts, dropped connections (WinError 10054),
+SSL handshake timeouts, and DNS failures (offline). Transient failures are
+retried with exponential backoff (honoring Retry-After); validation/auth errors
+are not retried.
 """
-import httpx
+import logging
+import time
 from typing import Optional
 
+import httpx
+
 from config import ELEVENLABS_API_KEY, ELEVENLABS_STT_URL
+
+# HTTP statuses worth retrying (transient server-side / rate limiting).
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+# Total attempts = _MAX_RETRIES + 1.
+_MAX_RETRIES = 3
+# Exponential backoff base (seconds): 0.8, 1.6, 3.2 ...
+_BASE_BACKOFF = 0.8
+_MAX_BACKOFF = 30.0
+
+# Connect short so true offline fails fast; read long for larger audio uploads.
+_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=5.0)
+
+
+class TranscriptionError(Exception):
+    """Transcription failed.
+
+    offline   -> looks like no connectivity (DNS / connect failure).
+    retryable -> the error class is transient (already retried internally).
+    """
+    def __init__(self, message: str, offline: bool = False, retryable: bool = False):
+        super().__init__(message)
+        self.offline = offline
+        self.retryable = retryable
 
 
 class ElevenLabsClient:
@@ -16,14 +48,14 @@ class ElevenLabsClient:
         """Get or create HTTP client with connection pooling"""
         if self._client is None or self._client.is_closed:
             self._client = httpx.Client(
-                timeout=30.0,
+                timeout=_TIMEOUT,
                 limits=httpx.Limits(max_keepalive_connections=5)
             )
         return self._client
 
     def transcribe(self, audio_data: bytes, language: str = None) -> str:
         """
-        Transcribe audio to text using ElevenLabs API
+        Transcribe audio to text using ElevenLabs API, with retries/backoff.
 
         Args:
             audio_data: WAV audio data as bytes
@@ -31,79 +63,107 @@ class ElevenLabsClient:
 
         Returns:
             Transcribed text
+
+        Raises:
+            TranscriptionError: after retries are exhausted or on a non-retryable
+            error. Inspect .offline / .retryable for messaging.
         """
         if not self.api_key:
-            raise ValueError("ElevenLabs API key is not configured")
+            raise TranscriptionError("ElevenLabs API key is not configured")
 
         client = self._get_client()
-
-        headers = {
-            "xi-api-key": self.api_key,
-        }
-
-        files = {
-            "file": ("audio.wav", audio_data, "audio/wav"),
-        }
-
-        data = {
-            "model_id": "scribe_v1",
-        }
-
-        # Only add language_code if specified (otherwise auto-detect)
+        headers = {"xi-api-key": self.api_key}
+        data = {"model_id": "scribe_v1"}
+        # Only pin the language if specified (otherwise scribe_v1 auto-detects).
         if language:
             data["language_code"] = language
 
-        response = client.post(
-            ELEVENLABS_STT_URL,
-            headers=headers,
-            files=files,
-            data=data
-        )
+        last_error: Optional[TranscriptionError] = None
 
-        if response.status_code != 200:
-            error_msg = f"ElevenLabs API error: {response.status_code}"
+        for attempt in range(_MAX_RETRIES + 1):
+            # Rebuild the multipart payload each attempt (the body is consumed).
+            files = {"file": ("audio.wav", audio_data, "audio/wav")}
+
             try:
-                error_data = response.json()
-                if "detail" in error_data:
-                    error_msg += f" - {error_data['detail']}"
-            except Exception:
-                error_msg += f" - {response.text}"
-            raise Exception(error_msg)
+                response = client.post(
+                    ELEVENLABS_STT_URL, headers=headers, files=files, data=data
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                # DNS / no route -> almost certainly offline.
+                last_error = TranscriptionError(
+                    "Нет связи с ElevenLabs (проверьте интернет)",
+                    offline=True, retryable=True
+                )
+                logging.warning(f"Connect failed (offline?), attempt {attempt + 1}: {e}")
+            except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                    httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError) as e:
+                # Transient transport error (timeouts, dropped connection 10054).
+                last_error = TranscriptionError(
+                    f"Сетевая ошибка при обращении к ElevenLabs: {e}",
+                    retryable=True
+                )
+                logging.warning(f"Transport error, attempt {attempt + 1}: {e}")
+            except httpx.HTTPError as e:
+                last_error = TranscriptionError(f"HTTP ошибка: {e}", retryable=True)
+                logging.warning(f"HTTP error, attempt {attempt + 1}: {e}")
+            else:
+                if response.status_code == 200:
+                    return response.json().get("text", "")
 
-        result = response.json()
-        return result.get("text", "")
+                is_retryable_status = response.status_code in _RETRY_STATUS
 
-    async def transcribe_async(self, audio_data: bytes, language: str = "ru") -> str:
-        """Async version of transcribe"""
-        if not self.api_key:
-            raise ValueError("ElevenLabs API key is not configured")
+                # Retryable HTTP status (rate limit / server hiccup)?
+                if is_retryable_status and attempt < _MAX_RETRIES:
+                    wait = self._retry_after(response)
+                    if wait is None:
+                        wait = self._backoff(attempt)
+                    logging.warning(
+                        f"ElevenLabs {response.status_code}, retrying in {wait:.1f}s "
+                        f"(attempt {attempt + 1}/{_MAX_RETRIES})"
+                    )
+                    time.sleep(wait)
+                    continue
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            headers = {
-                "xi-api-key": self.api_key,
-            }
+                # Out of retries on a transient status -> retryable=True (worth
+                # queueing). Permanent errors (400 audio_too_short, 401/403 auth)
+                # -> retryable=False (re-sending would never succeed).
+                raise self._error_from_response(response, retryable=is_retryable_status)
 
-            files = {
-                "file": ("audio.wav", audio_data, "audio/wav"),
-            }
+            # We got here only from an exception branch; back off and retry.
+            if attempt < _MAX_RETRIES:
+                time.sleep(self._backoff(attempt))
+                continue
+            raise last_error
 
-            data = {
-                "model_id": "scribe_v1",
-                "language_code": language,
-            }
+        # Loop exhausted (shouldn't normally reach here).
+        raise last_error or TranscriptionError("Transcription failed")
 
-            response = await client.post(
-                ELEVENLABS_STT_URL,
-                headers=headers,
-                files=files,
-                data=data
-            )
+    def _backoff(self, attempt: int) -> float:
+        return min(_BASE_BACKOFF * (2 ** attempt), _MAX_BACKOFF)
 
-            if response.status_code != 200:
-                raise Exception(f"ElevenLabs API error: {response.status_code} - {response.text}")
+    @staticmethod
+    def _retry_after(response: httpx.Response) -> Optional[float]:
+        """Parse Retry-After header (seconds), capped, if present."""
+        raw = response.headers.get("Retry-After")
+        if not raw:
+            return None
+        try:
+            return min(float(raw), _MAX_BACKOFF)
+        except (TypeError, ValueError):
+            return None
 
-            result = response.json()
-            return result.get("text", "")
+    @staticmethod
+    def _error_from_response(response: httpx.Response, retryable: bool = False) -> "TranscriptionError":
+        msg = f"ElevenLabs API error: {response.status_code}"
+        try:
+            data = response.json()
+            detail = data.get("detail") or data.get("message") or data
+            msg += f" - {detail}"
+        except Exception:
+            text = (response.text or "")[:200]
+            if text:
+                msg += f" - {text}"
+        return TranscriptionError(msg, retryable=retryable)
 
     def close(self):
         """Close the HTTP client"""

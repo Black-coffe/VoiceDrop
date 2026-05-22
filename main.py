@@ -112,8 +112,9 @@ from config import ELEVENLABS_API_KEY
 from core.audio_muter import AudioMuter
 from core.audio_recorder import AudioRecorder
 from core.db_manager import DatabaseManager
-from core.elevenlabs_api import ElevenLabsClient
+from core.elevenlabs_api import ElevenLabsClient, TranscriptionError
 from core.hotkey_manager import HotkeyManager
+from core.pending_queue import PendingQueue
 from core.text_inserter import TextInserter
 from gui.history_window import HistoryWindow
 from gui.recording_overlay import RecordingOverlay
@@ -139,6 +140,7 @@ class VoiceDropApp:
         self.elevenlabs_client = ElevenLabsClient()
         self.text_inserter = TextInserter()
         self.db = DatabaseManager()
+        self.pending_queue = PendingQueue()
 
         self.tray_icon: Optional[TrayIcon] = None
         self.history_window: Optional[HistoryWindow] = None
@@ -164,6 +166,11 @@ class VoiceDropApp:
         # Background scheduler for cleanup
         self.scheduler = BackgroundScheduler()
         self.scheduler.add_job(self.db.cleanup_old_recordings, 'interval', hours=1)
+        # Auto-resend recordings that failed transcription (offline / outage).
+        self.scheduler.add_job(
+            self._process_pending_queue, 'interval', seconds=45,
+            max_instances=1, coalesce=True
+        )
 
         # Hidden root window for customtkinter
         self._root: Optional[ctk.CTk] = None
@@ -361,6 +368,37 @@ class VoiceDropApp:
 
             logging.info(f"Done! Text: {text}")
 
+        except TranscriptionError as e:
+            # Transcription failed after retries. Queue it for auto-resend if the
+            # cause is transient (offline / outage); skip queueing permanent
+            # errors (400 audio_too_short, auth) that would never succeed.
+            should_queue = e.offline or e.retryable
+            queued = False
+            if should_queue:
+                queued = self.pending_queue.enqueue(audio_data, duration_ms, language) is not None
+
+            if e.offline:
+                logging.warning(f"Transcription failed (offline): {e}")
+                title = "VoiceDrop — нет сети"
+                msg = ("Нет интернета. Запись сохранена — дошлём автоматически."
+                       if queued else "Не удалось связаться с ElevenLabs. Проверьте интернет.")
+            elif should_queue:
+                logging.error(f"Transcription failed (will retry later): {e}")
+                title = "VoiceDrop — сервис недоступен"
+                msg = ("Сервис недоступен. Запись сохранена — дошлём автоматически."
+                       if queued else str(e))
+            else:
+                logging.error(f"Transcription failed: {e}")
+                title = "VoiceDrop — ошибка"
+                msg = str(e)
+
+            winsound.Beep(300, 200)  # error beep
+            if self.recording_overlay and self._root:
+                self._root.after(0, lambda m=msg: self.recording_overlay.show_error(m))
+                self._root.after(2500, self.recording_overlay.hide)
+            if self.tray_icon:
+                self.tray_icon.show_notification(title, msg)
+
         except Exception as e:
             logging.error(f"Error processing audio: {e}", exc_info=True)
             # Play error sound
@@ -368,7 +406,51 @@ class VoiceDropApp:
             if self.recording_overlay and self._root:
                 self._root.after(0, self.recording_overlay.hide)
             if self.tray_icon:
-                self.tray_icon.show_notification("Ошибка", str(e))
+                self.tray_icon.show_notification("VoiceDrop — ошибка", str(e))
+
+    def _process_pending_queue(self):
+        """Resend recordings that failed transcription earlier (offline / outage).
+
+        Runs on the background scheduler. On success the text goes to history (NOT
+        auto-pasted — the cursor has long moved on) plus a tray notification.
+        """
+        items = self.pending_queue.list_pending()
+        if not items:
+            return
+        logging.info(f"Pending queue: {len(items)} item(s), attempting resend...")
+        for item in items:
+            try:
+                audio = self.pending_queue.read_audio(item)
+            except Exception as e:
+                logging.error(f"Pending item {item.get('id')} unreadable, removing: {e}")
+                self.pending_queue.remove(item)
+                continue
+
+            try:
+                text = self.elevenlabs_client.transcribe(audio, language=item.get('language'))
+            except TranscriptionError as e:
+                if e.offline:
+                    logging.info("Pending resend: still offline, will retry later")
+                    break  # no point trying the rest of the queue while offline
+                logging.info(f"Pending resend still failing (will retry later): {e}")
+                continue
+            except Exception as e:
+                logging.error(f"Pending resend unexpected error: {e}", exc_info=True)
+                continue
+
+            text = (text or "").strip()
+            if text:
+                self.db.save_recording(text, item.get('duration_ms', 0), was_inserted=False)
+                logging.info(f"Pending item recovered -> history: {text[:50]}")
+                if self.tray_icon:
+                    preview = text[:60] + ('…' if len(text) > 60 else '')
+                    self.tray_icon.show_notification(
+                        "VoiceDrop — отложенная запись расшифрована",
+                        f"{preview}\n(сохранено в Историю — скопируйте оттуда)"
+                    )
+            else:
+                logging.info(f"Pending item {item.get('id')} transcribed empty; discarding")
+            self.pending_queue.remove(item)
 
     def _apply_saved_settings(self):
         """Apply saved settings on startup"""

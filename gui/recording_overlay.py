@@ -205,9 +205,9 @@ class RecordingOverlay:
         self._phase = 0.0
         self._level_history.clear()
 
-        # Reset status
+        # Reset status (also reset colour after a previous error state)
         if self._status_label:
-            self._status_label.config(text="Запись...")
+            self._status_label.config(text="Запись...", fg='#888888')
 
         if self._window:
             self._window.deiconify()
@@ -234,6 +234,13 @@ class RecordingOverlay:
         """Show result after transcription"""
         if self._status_label:
             self._status_label.config(text=f"{word_count} слов, {char_count} символов")
+
+    def show_error(self, message: str):
+        """Show an error/offline state in red (caller schedules hide)."""
+        self._is_visible = True
+        if self._status_label:
+            short = (message[:38] + '…') if len(message) > 38 else message
+            self._status_label.config(text=f"⚠ {short}", fg='#ff6b6b')
 
     def destroy(self):
         """Destroy the overlay window"""
