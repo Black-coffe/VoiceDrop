@@ -68,6 +68,7 @@ class TrayIcon:
         on_set_mode: Optional[Callable[[str], None]] = None,
         get_mode: Optional[Callable[[], str]] = None,
         on_retranscribe: Optional[Callable[[str], None]] = None,
+        on_copy_last: Optional[Callable[[], None]] = None,
         on_set_insert_mode: Optional[Callable[[str], None]] = None,
         get_insert_mode: Optional[Callable[[], str]] = None,
         on_toggle_autostart: Optional[Callable[[], None]] = None,
@@ -83,6 +84,7 @@ class TrayIcon:
         self.on_set_mode = on_set_mode
         self.get_mode = get_mode
         self.on_retranscribe = on_retranscribe
+        self.on_copy_last = on_copy_last
         self.on_set_insert_mode = on_set_insert_mode
         self.get_insert_mode = get_insert_mode
         self.on_toggle_autostart = on_toggle_autostart
@@ -133,6 +135,7 @@ class TrayIcon:
             Item("Язык", pystray.Menu(
                 *[self._lang_item(label, code) for label, code in self.LANGUAGE_OPTIONS]
             )),
+            Item("Скопировать последнее", lambda icon, item: self._handle_copy_last()),
             Item("Переписать последнее", pystray.Menu(
                 Item("Русский", lambda icon, item: self._handle_retranscribe("ru")),
                 Item("Українська", lambda icon, item: self._handle_retranscribe("uk")),
@@ -201,6 +204,10 @@ class TrayIcon:
         """Re-transcribe the last recording in a forced language (off the tray thread)."""
         if self.on_retranscribe:
             threading.Thread(target=self.on_retranscribe, args=(language,), daemon=True).start()
+
+    def _handle_copy_last(self):
+        if self.on_copy_last:
+            threading.Thread(target=self.on_copy_last, daemon=True).start()
 
     def _current_insert_mode(self) -> str:
         if self.get_insert_mode:

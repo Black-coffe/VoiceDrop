@@ -168,6 +168,7 @@ class VoiceDropApp:
         # language (one-click fix for RU/UK/EN auto-detect bleed).
         self._last_audio_data: Optional[bytes] = None
         self._last_duration_ms = 0
+        self._last_text = ""  # last produced text (for tray "Скопировать последнее")
 
         # Force unmute all audio on startup (in case previous instance crashed)
         logging.info("Force unmuting all audio on startup...")
@@ -397,6 +398,8 @@ class VoiceDropApp:
                 # Hide overlay after 1.5 seconds
                 self._root.after(1500, self.recording_overlay.hide)
 
+            self._last_text = text  # remember for "Скопировать последнее"
+
             # Deliver text per the chosen insert mode
             insert_mode = self._get_insert_mode()
             if insert_mode == "clipboard":
@@ -618,6 +621,17 @@ class VoiceDropApp:
         if self.tray_icon:
             self.tray_icon.show_notification("VoiceDrop — вставка", names.get(mode, mode))
 
+    def _copy_last(self):
+        """Copy the last produced text to the clipboard (tray quick action)."""
+        if self._last_text:
+            self.text_inserter.copy_to_clipboard(self._last_text)
+            logging.info("Copied last text to clipboard")
+            if self.tray_icon:
+                preview = self._last_text[:60] + ('…' if len(self._last_text) > 60 else '')
+                self.tray_icon.show_notification("VoiceDrop — скопировано", preview)
+        elif self.tray_icon:
+            self.tray_icon.show_notification("VoiceDrop", "Нет последнего текста")
+
     def _retranscribe_last(self, language: str):
         """Re-transcribe the last recording with a forced language (RU/UK/EN bleed fix)."""
         audio = self._last_audio_data
@@ -643,6 +657,7 @@ class VoiceDropApp:
             # Deterministic passes only (dictionary + commands); language is forced.
             text = self.text_replacer.apply(text)
             text = self.voice_commands.apply(text)
+            self._last_text = text
             self.text_inserter.copy_to_clipboard(text)
             self.db.save_recording(text, duration_ms, was_inserted=False)
             winsound.Beep(800, 100)
@@ -807,6 +822,7 @@ class VoiceDropApp:
             on_set_mode=self._set_mode,
             get_mode=self._get_mode,
             on_retranscribe=self._retranscribe_last,
+            on_copy_last=self._copy_last,
             on_set_insert_mode=self._set_insert_mode,
             get_insert_mode=self._get_insert_mode,
             on_toggle_autostart=self._toggle_autostart,
