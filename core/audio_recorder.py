@@ -22,6 +22,11 @@ _HOSTAPI_PRIORITY = {
     'Windows WDM-KS': 3,
 }
 
+# How many times to try opening the input stream. Attempt 1 uses PortAudio's
+# cached device list; the rest rebuild that list first (cure for a stale cache
+# after the audio device set changes mid-run — PaErrorCode -9999).
+_OPEN_MAX_ATTEMPTS = 3
+
 
 class AudioRecorder:
     def __init__(self):
@@ -70,38 +75,80 @@ class AudioRecorder:
             return time.time() - self._start_time
         return 0.0
 
+    def _refresh_portaudio(self):
+        """Rebuild PortAudio's device list to match the CURRENT system state.
+
+        PortAudio enumerates devices once at process init and caches that list.
+        When the set of audio devices changes mid-run (a Bluetooth headset
+        connects, the USB mic power-cycles, Windows re-enumerates), the cached
+        index for our mic goes stale and opening it fails with
+        PaErrorCode -9999 'device ID out of range'. Tearing PortAudio down and
+        re-initialising forces a fresh scan so the next resolve+open sees reality.
+        Must only be called when no stream is open.
+        """
+        try:
+            sd._terminate()
+            sd._initialize()
+            logging.info("Refreshed PortAudio device list (was stale)")
+        except Exception as e:
+            logging.error(f"PortAudio refresh failed: {e}", exc_info=True)
+
     def start_recording(self):
         """Start recording audio from the configured mic (resolved BY NAME).
 
         Raises RuntimeError if a specific microphone was configured but is not
         currently present — we never silently fall back to the system default.
+
+        The open is retried after refreshing PortAudio's (possibly stale) device
+        cache: that is the in-process cure for the intermittent
+        'device ID out of range' failures that otherwise need an app restart.
         """
-        device_index = self._resolve_device_for_capture()
+        last_err: Optional[Exception] = None
+        # Attempt 0 uses the cached device list (fast path). Later attempts
+        # rebuild the list first — the slow path only runs when the fast one fails.
+        for attempt in range(_OPEN_MAX_ATTEMPTS):
+            if attempt > 0:
+                self._refresh_portaudio()
 
-        with self._lock:
-            self._frames = []
-            self.is_recording = True
-            self._start_time = time.time()
+            try:
+                device_index = self._resolve_device_for_capture()
+            except RuntimeError as e:
+                # Mic not found in the current list — a refresh may reveal it.
+                last_err = e
+                logging.warning(f"Mic resolve failed (attempt {attempt + 1}): {e}")
+                continue
 
-        with self._level_lock:
-            self._current_level = 0.0
-
-        try:
-            self._stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=self.channels,
-                dtype=np.float32,
-                callback=self._audio_callback,
-                blocksize=1024,
-                device=device_index
-            )
-            self._stream.start()
-        except Exception:
-            # Roll back so a failed open can't wedge the recording state.
             with self._lock:
-                self.is_recording = False
-            self._stream = None
-            raise
+                self._frames = []
+                self.is_recording = True
+                self._start_time = time.time()
+            with self._level_lock:
+                self._current_level = 0.0
+
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=self.channels,
+                    dtype=np.float32,
+                    callback=self._audio_callback,
+                    blocksize=1024,
+                    device=device_index
+                )
+                self._stream.start()
+                return  # success
+            except Exception as e:
+                # Roll back so a failed open can't wedge the recording state.
+                with self._lock:
+                    self.is_recording = False
+                self._stream = None
+                last_err = e
+                logging.warning(
+                    f"InputStream open failed (attempt {attempt + 1}): {e}"
+                )
+
+        # All attempts exhausted — surface the last error to the caller.
+        assert last_err is not None
+        raise last_err
 
     def stop_recording(self) -> tuple[bytes, int]:
         """Stop recording and return audio data as WAV bytes and duration in ms"""
