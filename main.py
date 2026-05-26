@@ -162,6 +162,11 @@ class VoiceDropApp:
         self.recording_overlay: Optional[RecordingOverlay] = None
 
         self._is_recording = False
+        # True while _process_audio is doing the post-release work (transcribe
+        # + polish + insert). A new press during this window would race the
+        # shared AudioRecorder state (frames buffer, stream handle) and corrupt
+        # the next clip — see the truncation bug user hit on rapid presses.
+        self._is_processing = False
         self._lock = threading.Lock()
         self._is_shutting_down = False
         # Monotonic id per record session — lets a late/slow mute detect that its
@@ -218,6 +223,17 @@ class VoiceDropApp:
         try:
             with self._lock:
                 if self._is_recording:
+                    return
+                if self._is_processing:
+                    # Previous clip is still being transcribed / inserted.
+                    # Starting now would share the AudioRecorder's _frames /
+                    # _stream state with the in-flight pipeline and corrupt
+                    # the new clip — observed as Scribe returning a few words
+                    # then "..." or "--".
+                    logging.info("Hotkey press ignored: previous clip still processing")
+                    # Soft error cue so the user knows the press registered
+                    # but was rejected. They retry in ~1 s after Scribe replies.
+                    winsound.Beep(300, 80)
                     return
                 self._is_recording = True
                 self._record_session_id += 1
@@ -356,6 +372,10 @@ class VoiceDropApp:
         # Keep this clip so it can be re-transcribed in another language later.
         self._last_audio_data = audio_data
         self._last_duration_ms = duration_ms
+        # Mark the "busy" window so _on_hotkey_press can reject mid-pipeline
+        # presses cleanly. Released in finally regardless of success/failure.
+        with self._lock:
+            self._is_processing = True
         try:
             # Transcribe
             logging.info("Sending to ElevenLabs...")
@@ -464,6 +484,10 @@ class VoiceDropApp:
                 self._root.after(0, self.recording_overlay.hide)
             if self.tray_icon:
                 self.tray_icon.show_notification("VoiceDrop — ошибка", str(e))
+        finally:
+            # Release the press-gate so the next hotkey press is accepted.
+            with self._lock:
+                self._is_processing = False
 
     def _process_pending_queue(self):
         """Resend recordings that failed transcription earlier (offline / outage).

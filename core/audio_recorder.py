@@ -56,7 +56,10 @@ class AudioRecorder:
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
         """Callback for audio stream"""
         if status:
-            print(f"Audio status: {status}")
+            # PortAudio buffer events (input_overflow / input_underflow) used
+            # to go to stdout which was a black hole — promoted to the logger
+            # so transcription truncation can be correlated with buffer loss.
+            logging.warning(f"PortAudio status: {status}")
         if self.is_recording:
             with self._lock:
                 self._frames.append(indata.copy())
@@ -177,8 +180,26 @@ class AudioRecorder:
             if not self._frames:
                 return b"", 0
 
+            chunks = len(self._frames)
             audio_data = np.concatenate(self._frames, axis=0)
             self._frames = []
+
+        # Compare wall-clock duration with actual captured audio length —
+        # a large gap means PortAudio dropped frames (input_overflow) or
+        # the stream stopped mid-recording. Either way, the audio sent to
+        # Scribe is shorter than the user expects → "обрезает голос".
+        actual_ms = int(round(len(audio_data) / float(self.sample_rate) * 1000))
+        if duration_ms > 500 and actual_ms < duration_ms * 0.7:
+            logging.warning(
+                f"Audio captured ({actual_ms}ms, {chunks} chunks) is much "
+                f"shorter than wall-clock ({duration_ms}ms) — likely "
+                f"PortAudio frame loss. Sample rate={self.sample_rate}"
+            )
+        else:
+            logging.info(
+                f"Audio: wall {duration_ms}ms / captured {actual_ms}ms "
+                f"({chunks} chunks @ {self.sample_rate}Hz)"
+            )
 
         # Convert to WAV bytes
         buffer = io.BytesIO()
