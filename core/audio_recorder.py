@@ -22,38 +22,20 @@ _HOSTAPI_PRIORITY = {
     'Windows WDM-KS': 3,
 }
 
-# How many times to try opening the input stream within a SINGLE key press.
-# Attempt 1 uses PortAudio's cached device list (fast, zero added latency when
-# nothing is wrong); later attempts rebuild that list first (cure for a stale
-# cache after the audio device set changes mid-run — PaErrorCode -9999).
-_OPEN_MAX_ATTEMPTS = 4
-
-# After rebuilding the device list, give PortAudio/Windows a moment to finish
-# re-enumerating before querying it again. Re-initialising and immediately
-# querying returns a half-built list (the mic momentarily looks "not found"),
-# and hammering terminate/initialize back-to-back leaves the host API in a bad
-# state — that is exactly why recovery used to need several key presses. The
-# settle grows per attempt (0.25s, 0.50s, 0.75s) so recovery happens within ONE
-# press; only paid on the slow path, never on a healthy mic.
-_REFRESH_SETTLE_SEC = 0.25
-
-# Background watcher poll interval. Also acts as the settle between its refreshes:
-# rebuilding the list at most every couple of seconds gives a slow USB mic time
-# to finish re-enumerating, instead of the harmful back-to-back hammering.
-_WATCHER_POLL_SEC = 2.0
-
-
-class RecordingAborted(Exception):
-    """The start was cancelled (hotkey released) before recording could begin.
-
-    Not an error: the user let go while we were still retrying a flaky mic, so
-    there is simply nothing to record. Callers should reset quietly — no error
-    cue or notification.
-    """
+# Open at most twice: first try uses the cached device list; if it fails, wait
+# a short settle delay and retry the SAME device once. We deliberately do NOT
+# call sd._terminate()/sd._initialize() between attempts — issue #516 / #47:
+# refreshing PortAudio's cache mid-process is documented to lose devices and
+# can crash the interpreter. Production log confirms it: FOX disappeared after
+# the refresh and never came back without an app restart.
+_OPEN_MAX_ATTEMPTS = 2
+_OPEN_RETRY_SETTLE_SEC = 0.18
 
 
 class AudioRecorder:
     def __init__(self):
+        # Fallback rate used only if querying the device's native rate fails.
+        # The actual capture rate is set per-recording in start_recording().
         self.sample_rate = SAMPLE_RATE
         self.channels = CHANNELS
         self.is_recording = False
@@ -70,18 +52,6 @@ class AudioRecorder:
         # Real-time audio level for visualization
         self._current_level: float = 0.0
         self._level_lock = threading.Lock()
-
-        # Serialises every PortAudio re-init (terminate/initialize) so the
-        # background watcher and a key press can never rebuild the device list
-        # at the same time. NEVER hold this while a stream is open.
-        self._pa_lock = threading.Lock()
-
-        # Background device watcher: keeps PortAudio's view of the configured mic
-        # fresh OUT of the key-press path, so a slow-to-reappear USB mic is ready
-        # by the time the user actually presses the hotkey.
-        self._watcher_thread: Optional[threading.Thread] = None
-        self._watcher_stop = threading.Event()
-        self._mic_present: bool = True  # last known state, to log only on change
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
         """Callback for audio stream"""
@@ -111,177 +81,87 @@ class AudioRecorder:
             return time.time() - self._start_time
         return 0.0
 
-    def _refresh_portaudio(self):
-        """Rebuild PortAudio's device list to match the CURRENT system state.
+    def _query_native_samplerate(self, device_index: Optional[int]) -> int:
+        """Return the device's native samplerate; fall back to SAMPLE_RATE on failure.
 
-        PortAudio enumerates devices once at process init and caches that list.
-        When the set of audio devices changes mid-run (a Bluetooth headset
-        connects, the USB mic power-cycles, Windows re-enumerates), the cached
-        index for our mic goes stale and opening it fails with
-        PaErrorCode -9999 'device ID out of range'. Tearing PortAudio down and
-        re-initialising forces a fresh scan so the next resolve+open sees reality.
-        Must only be called when no stream is open.
+        We open at the device's native rate so Windows shared-mode's resampler
+        is never in the path — that resampler is the leading cause of the
+        intermittent PaErrorCode -9999 'device ID out of range' on USB mics
+        whose native format (e.g. FOX = 44100 Hz, some interfaces 48000/88200)
+        doesn't match VoiceDrop's STT-target 16 kHz. ElevenLabs Scribe accepts
+        any common samplerate, so we just upload the WAV at the captured rate.
         """
         try:
-            sd._terminate()
-            sd._initialize()
-            logging.info("Refreshed PortAudio device list (was stale)")
+            info = sd.query_devices(device_index) if device_index is not None else sd.query_devices(kind='input')
+            sr = int(round(float(info.get('default_samplerate') or 0)))
+            if sr >= 8000:
+                return sr
         except Exception as e:
-            logging.error(f"PortAudio refresh failed: {e}", exc_info=True)
+            logging.warning(f"Could not query device samplerate, using fallback {SAMPLE_RATE}: {e}")
+        return SAMPLE_RATE
 
-    def start_recording(self, should_abort: Optional[Callable[[], bool]] = None):
+    def start_recording(self):
         """Start recording audio from the configured mic (resolved BY NAME).
 
         Raises RuntimeError if a specific microphone was configured but is not
         currently present — we never silently fall back to the system default.
 
-        The open is retried, refreshing PortAudio's (possibly stale) device cache
-        and letting it settle between tries: that is the in-process cure for the
-        intermittent 'device ID out of range' failures that otherwise need an app
-        restart. Because the settle is paced, recovery now completes within a
-        single key press instead of taking several.
-
-        should_abort: optional predicate polled between tries. When the hotkey is
-        released mid-retry it returns True; we then stop and raise
-        RecordingAborted instead of starting a recording nobody asked for.
+        Open path: query the device's native samplerate and open at that rate.
+        On failure, wait briefly and retry the SAME device once. We do NOT
+        rebuild PortAudio's device cache here — see _OPEN_MAX_ATTEMPTS note.
         """
-        def aborted() -> bool:
-            return should_abort is not None and should_abort()
-
         last_err: Optional[Exception] = None
-        # Hold the PortAudio lock for the whole open sequence so the background
-        # watcher can't rebuild the device list while we resolve/open (released
-        # the moment recording starts — never held during the recording itself).
-        with self._pa_lock:
-            # Attempt 0 uses the cached device list (fast path, no delay). Later
-            # attempts rebuild the list and let it settle — slow path only on failure.
-            for attempt in range(_OPEN_MAX_ATTEMPTS):
-                if aborted():
-                    raise RecordingAborted()
+        for attempt in range(_OPEN_MAX_ATTEMPTS):
+            if attempt > 0:
+                # Brief settle so the device/driver has a moment to recover
+                # (USB wakeup, MME WaveIn driver re-arm). No cache refresh.
+                time.sleep(_OPEN_RETRY_SETTLE_SEC)
 
-                if attempt > 0:
-                    self._refresh_portaudio()
-                    time.sleep(_REFRESH_SETTLE_SEC * attempt)  # let it re-enumerate
-                    if aborted():
-                        raise RecordingAborted()
-
-                try:
-                    device_index = self._resolve_device_for_capture()
-                except RuntimeError as e:
-                    # Mic not found in the current list — a refresh may reveal it.
-                    last_err = e
-                    logging.warning(f"Mic resolve failed (attempt {attempt + 1}): {e}")
-                    continue
-
-                with self._lock:
-                    self._frames = []
-                    self.is_recording = True
-                    self._start_time = time.time()
-                with self._level_lock:
-                    self._current_level = 0.0
-
-                try:
-                    self._stream = sd.InputStream(
-                        samplerate=self.sample_rate,
-                        channels=self.channels,
-                        dtype=np.float32,
-                        callback=self._audio_callback,
-                        blocksize=1024,
-                        device=device_index
-                    )
-                    self._stream.start()
-                except Exception as e:
-                    # Roll back so a failed open can't wedge the recording state.
-                    with self._lock:
-                        self.is_recording = False
-                    self._stream = None
-                    last_err = e
-                    logging.warning(
-                        f"InputStream open failed (attempt {attempt + 1}): {e}"
-                    )
-                    continue
-
-                # Stream is live. If the key was released while we were (re)trying,
-                # tear it down rather than leave a recording that nobody will stop.
-                if aborted():
-                    try:
-                        self._stream.stop()
-                        self._stream.close()
-                    except Exception:
-                        pass
-                    self._stream = None
-                    with self._lock:
-                        self.is_recording = False
-                    raise RecordingAborted()
-
-                if attempt > 0:
-                    logging.info(f"Recording recovered on attempt {attempt + 1}")
-                return  # success
-
-            # All attempts exhausted — surface the last error to the caller.
-            assert last_err is not None
-            raise last_err
-
-    def start_device_watcher(self):
-        """Start the background thread that keeps the configured mic resolvable.
-
-        A slow USB mic (or one that drops when another audio device connects)
-        can be absent from PortAudio's list for several seconds — far longer than
-        a key press can afford to block. Instead of making the user mash the
-        hotkey, this rebuilds the device list every couple of seconds IN THE
-        BACKGROUND until the mic resolves, then idles. So by the time the hotkey
-        is actually pressed, the list is already fresh and recording starts at
-        once. Safe no-op if already running or if no specific mic is configured.
-        """
-        if self._watcher_thread and self._watcher_thread.is_alive():
-            return
-        self._watcher_stop.clear()
-        self._watcher_thread = threading.Thread(
-            target=self._device_watcher_loop, daemon=True, name="mic-watcher"
-        )
-        self._watcher_thread.start()
-        logging.info("Mic device watcher started")
-
-    def stop_device_watcher(self):
-        """Stop the background device watcher (called on shutdown)."""
-        self._watcher_stop.set()
-
-    def _device_watcher_loop(self):
-        while not self._watcher_stop.wait(_WATCHER_POLL_SEC):
-            # Only meaningful when a specific mic is configured (resolve-by-name).
-            if not self._device_name:
-                continue
-            # Never rebuild PortAudio while capturing — re-init with an open
-            # stream is unsafe. The lock + these guards keep us clear of a press.
-            if self.is_recording or self._stream is not None:
-                continue
             try:
-                if not self._pa_lock.acquire(blocking=False):
-                    continue  # a key press owns PortAudio right now; try next tick
-                try:
-                    if self.is_recording or self._stream is not None:
-                        continue
-                    idx, detail = self.resolve_device_index()
-                    if idx is None and self._device_name:
-                        # Mic missing: rebuild the list so the next press sees it.
-                        self._refresh_portaudio()
-                        idx, detail = self.resolve_device_index()
-                finally:
-                    self._pa_lock.release()
-            except Exception as e:
-                logging.error(f"Device watcher error: {e}", exc_info=True)
-                continue
+                device_index = self._resolve_device_for_capture()
+            except RuntimeError as e:
+                # Configured mic genuinely not in the current device list —
+                # no point retrying without external state changing.
+                raise
 
-            present = idx is not None
-            if present != self._mic_present:
-                self._mic_present = present
-                if present:
-                    logging.info(f"Device watcher: mic back online -> {detail}")
+            capture_sr = self._query_native_samplerate(device_index)
+
+            with self._lock:
+                self._frames = []
+                self.is_recording = True
+                self._start_time = time.time()
+                self.sample_rate = capture_sr
+            with self._level_lock:
+                self._current_level = 0.0
+
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=capture_sr,
+                    channels=self.channels,
+                    dtype=np.float32,
+                    callback=self._audio_callback,
+                    blocksize=1024,
+                    device=device_index
+                )
+                self._stream.start()
+                if attempt == 0:
+                    logging.info(f"Recording at native {capture_sr} Hz")
                 else:
-                    logging.warning(
-                        f"Device watcher: configured mic «{self._device_name}» "
-                        f"not present; refreshing until it returns"
-                    )
+                    logging.info(f"Recording at native {capture_sr} Hz (recovered on attempt {attempt + 1})")
+                return  # success
+            except Exception as e:
+                # Roll back so a failed open can't wedge the recording state.
+                with self._lock:
+                    self.is_recording = False
+                self._stream = None
+                last_err = e
+                logging.warning(
+                    f"InputStream open failed (attempt {attempt + 1}): {e}"
+                )
+
+        # All attempts exhausted — surface the last error to the caller.
+        assert last_err is not None
+        raise last_err
 
     def stop_recording(self) -> tuple[bytes, int]:
         """Stop recording and return audio data as WAV bytes and duration in ms"""

@@ -111,7 +111,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from config import ELEVENLABS_API_KEY, HISTORY_RETENTION_HOURS, APP_VERSION
 from core import autostart
 from core.audio_muter import AudioMuter
-from core.audio_recorder import AudioRecorder, RecordingAborted
+from core.audio_recorder import AudioRecorder
 from core.db_manager import DatabaseManager
 from core.elevenlabs_api import ElevenLabsClient, TranscriptionError
 from core.hotkey_manager import HotkeyManager
@@ -233,21 +233,8 @@ class VoiceDropApp:
                 winsound.Beep(600, 50)
 
             # 1) START CAPTURE IMMEDIATELY — no blocking work before this.
-            # Pass an abort check so that if the mic is briefly unavailable and
-            # start_recording is still retrying when the user lets go, it stops
-            # cleanly instead of starting a recording after release.
             try:
-                self.audio_recorder.start_recording(
-                    should_abort=lambda: not self._is_recording
-                )
-            except RecordingAborted:
-                # Released during the mic retry — nothing to record. The release
-                # handler already reset UI/mute state; just clear our flag quietly
-                # (no error cue or notification — this is a normal short tap).
-                logging.info("Recording start aborted (key released during mic retry)")
-                with self._lock:
-                    self._is_recording = False
-                return
+                self.audio_recorder.start_recording()
             except Exception as e:
                 logging.error(f"Failed to start recording: {e}", exc_info=True)
                 with self._lock:
@@ -802,11 +789,6 @@ class VoiceDropApp:
         except Exception as e:
             logging.error(f"Error unmuting audio: {e}")
 
-        try:
-            self.audio_recorder.stop_device_watcher()
-        except Exception as e:
-            logging.error(f"Error stopping device watcher: {e}")
-
         if self.hotkey_manager:
             try:
                 self.hotkey_manager.stop()
@@ -898,11 +880,6 @@ class VoiceDropApp:
             modifier_vks=self._code_modifier_vks
         )
         self.hotkey_manager.start()
-
-        # Keep the configured mic resolvable in the background, so a slow-to-
-        # reappear USB mic is ready by the time the hotkey is pressed (instead
-        # of the first presses after launch/device-change failing).
-        self.audio_recorder.start_device_watcher()
 
         # Create tray icon
         self.tray_icon = TrayIcon(
