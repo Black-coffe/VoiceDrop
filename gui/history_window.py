@@ -5,7 +5,7 @@ import os
 import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -50,6 +50,24 @@ _DEFAULT_PERIOD = "Всё время"
 # Each row turns into a few CTk widgets, so we cap this rather than letting
 # the window try to render an unbounded list.
 _LIST_LIMIT = 2000
+
+
+def _parse_db_dt_local(s: str) -> Optional[datetime]:
+    """Parse the DB's UTC `created_at` text and return it in LOCAL time.
+
+    The recordings table stores `CURRENT_TIMESTAMP` which SQLite writes as
+    `'YYYY-MM-DD HH:MM:SS'` (UTC, naive). `datetime.fromisoformat` accepts
+    both space and 'T' separators on Python 3.11+. We tag it as UTC and
+    convert to the system local zone so the UI / day-grouping shows what
+    the user actually experienced (not raw UTC).
+    """
+    try:
+        dt = datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone()
 
 
 def _format_day_header(d: date) -> str:
@@ -278,11 +296,8 @@ class HistoryWindow(ctk.CTkToplevel):
         grid_row = 0
         last_day: Optional[date] = None
         for idx, rec in enumerate(records):
-            try:
-                rec_dt = datetime.fromisoformat(rec['created_at'])
-                rec_day = rec_dt.date()
-            except (ValueError, TypeError):
-                rec_day = None
+            rec_dt = _parse_db_dt_local(rec['created_at'])
+            rec_day = rec_dt.date() if rec_dt else None
 
             if rec_day is not None and rec_day != last_day:
                 self._create_day_header(grid_row, rec_day, idx, records)
@@ -300,12 +315,12 @@ class HistoryWindow(ctk.CTkToplevel):
         # Count how many records fall on this day (contiguous from start_idx).
         count = 0
         for r in records[start_idx:]:
-            try:
-                if datetime.fromisoformat(r['created_at']).date() == day:
-                    count += 1
-                else:
-                    break
-            except (ValueError, TypeError):
+            rdt = _parse_db_dt_local(r['created_at'])
+            if rdt is None:
+                break
+            if rdt.date() == day:
+                count += 1
+            else:
                 break
 
         header = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
@@ -326,11 +341,8 @@ class HistoryWindow(ctk.CTkToplevel):
         frame.grid(row=grid_row, column=0, sticky="ew", pady=(5 if is_latest else 2))
         frame.grid_columnconfigure(1, weight=1)
 
-        try:
-            created_at = datetime.fromisoformat(recording['created_at'])
-            time_str = created_at.strftime("%d.%m %H:%M")
-        except (ValueError, TypeError):
-            time_str = "??:??"
+        created_at = _parse_db_dt_local(recording['created_at'])
+        time_str = created_at.strftime("%d.%m %H:%M") if created_at else "??:??"
 
         time_label = ctk.CTkLabel(
             frame, text=time_str, font=ctk.CTkFont(size=11), width=90
@@ -393,11 +405,8 @@ class HistoryWindow(ctk.CTkToplevel):
         try:
             blocks = []
             for r in recordings:
-                ts = r.get('created_at', '')
-                try:
-                    ts = datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M:%S")
-                except (ValueError, TypeError):
-                    pass
+                ts_local = _parse_db_dt_local(r.get('created_at', ''))
+                ts = ts_local.strftime("%Y-%m-%d %H:%M:%S") if ts_local else r.get('created_at', '')
                 text = r.get('text', '')
                 blocks.append(f"### {ts}\n\n{text}\n" if is_md else f"[{ts}]\n{text}\n")
             with open(path, 'w', encoding='utf-8') as f:

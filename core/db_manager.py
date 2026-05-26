@@ -5,11 +5,27 @@ import logging
 import re
 import sqlite3
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from config import DB_PATH, HISTORY_RETENTION_HOURS
+
+
+def _to_db_string(dt: datetime) -> str:
+    """Convert a (presumed-local-naive) datetime to the DB's UTC text format.
+
+    The recordings table stores `created_at` as `CURRENT_TIMESTAMP` which
+    SQLite writes as UTC text `'YYYY-MM-DD HH:MM:SS'` (space separator).
+    Python's `datetime.isoformat()` uses `'T'` instead — so comparing the
+    two as strings is broken at midnight boundaries (`' '` < `'T'`).
+    Always run user-facing range bounds through this helper.
+    """
+    if dt.tzinfo is None:
+        # Naive — treat as local time by attaching the system tz.
+        dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 class DatabaseManager:
@@ -128,7 +144,7 @@ class DatabaseManager:
                 FROM recordings WHERE created_at > ?
                 ORDER BY created_at DESC LIMIT ?
                 """,
-                (cutoff.isoformat(), limit)
+                (_to_db_string(cutoff), limit)
             )
         else:
             cursor = conn.execute(
@@ -189,16 +205,20 @@ class DatabaseManager:
         end: Optional[datetime] = None,
         limit: int = 5000,
     ) -> list[dict]:
-        """Recordings whose created_at is within [start, end]. None = open-ended."""
+        """Recordings whose created_at is within [start, end]. None = open-ended.
+
+        Bounds are assumed local (naive == local) and converted to the DB's
+        UTC text format before comparing — see _to_db_string.
+        """
         conn = self._get_connection()
         clauses = []
         params: list = []
         if start is not None:
             clauses.append("created_at >= ?")
-            params.append(start.isoformat())
+            params.append(_to_db_string(start))
         if end is not None:
             clauses.append("created_at <= ?")
-            params.append(end.isoformat())
+            params.append(_to_db_string(end))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         cursor = conn.execute(
@@ -238,7 +258,7 @@ class DatabaseManager:
             return  # keep forever
         conn = self._get_connection()
         cutoff = datetime.now() - timedelta(hours=self.retention_hours)
-        conn.execute("DELETE FROM recordings WHERE created_at < ?", (cutoff.isoformat(),))
+        conn.execute("DELETE FROM recordings WHERE created_at < ?", (_to_db_string(cutoff),))
         conn.commit()
 
     def clear_all(self):
