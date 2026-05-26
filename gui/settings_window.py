@@ -171,23 +171,34 @@ class SettingsWindow(ctk.CTkToplevel):
         )
         self.refresh_btn.grid(row=0, column=2, pady=15, padx=(0, 15))
 
-        # Test microphone button
+        # Test microphone — records 3 s, shows live level, plays it back,
+        # and reports a verdict so the user can verify the mic before
+        # depending on it for a real dictation.
         self.test_frame = ctk.CTkFrame(self)
         self.test_frame.grid(row=2, column=0, pady=5, padx=20, sticky="ew")
+        self.test_frame.grid_columnconfigure(1, weight=1)
 
         self.test_btn = ctk.CTkButton(
             self.test_frame,
             text="🎤 Проверить микрофон",
-            command=self._test_microphone
+            width=180,
+            command=self._test_microphone,
         )
-        self.test_btn.pack(pady=10, padx=15, side="left")
+        self.test_btn.grid(row=0, column=0, padx=15, pady=10, sticky="w")
+
+        self.test_level = ctk.CTkProgressBar(self.test_frame, width=180)
+        self.test_level.set(0)
+        self.test_level.grid(row=0, column=1, padx=(0, 15), pady=10, sticky="ew")
 
         self.test_status = ctk.CTkLabel(
             self.test_frame,
-            text="",
-            font=ctk.CTkFont(size=12)
+            text="Нажмите и говорите 3 секунды — я воспроизведу запись",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
         )
-        self.test_status.pack(pady=10, padx=15, side="left")
+        self.test_status.grid(row=1, column=0, columnspan=2, padx=15, pady=(0, 10), sticky="w")
+
+        self._test_in_progress = False
 
         # ===== Language section =====
         self.lang_frame = ctk.CTkFrame(self)
@@ -422,41 +433,165 @@ class SettingsWindow(ctk.CTkToplevel):
         except ValueError:
             return -1
 
+    _TEST_DURATION_SEC = 3.0
+
     def _test_microphone(self):
-        """Test selected microphone"""
-        self.test_status.configure(text="Проверка...")
-        self.update()
+        """Record 3 s from the selected mic, show live level, play it back,
+        then a verdict line. Runs the capture in a worker thread so the UI
+        stays responsive; widget updates from the worker go through after().
+        """
+        if self._test_in_progress:
+            return
+
+        selected_idx = self._get_selected_mic_index()
+        if selected_idx < 0 or selected_idx >= len(self.microphones):
+            self.test_status.configure(text="Микрофон не выбран", text_color="orange")
+            return
+
+        mic = self.microphones[selected_idx]
+        device_id = mic.get('id')
+        device_name = mic.get('name', f"#{device_id}")
+
+        self._test_in_progress = True
+        self.test_btn.configure(state="disabled")
+        self.test_status.configure(
+            text=f"Запись с «{device_name}» — говорите…", text_color="white"
+        )
+        self.test_level.set(0)
+
+        threading.Thread(
+            target=self._test_microphone_worker,
+            args=(device_id, device_name),
+            daemon=True,
+        ).start()
+
+    def _test_microphone_worker(self, device_id, device_name):
+        """Capture → playback → verdict. Runs off the UI thread."""
+        import time
+        import logging
+
+        import numpy as np
+        import sounddevice as sd
+
+        duration = self._TEST_DURATION_SEC
+
+        # Open at the device's native sample rate — same approach as
+        # core/audio_recorder.py after the mic-saga fix. Avoids -9999 from
+        # Windows shared-mode resampler picking 16 kHz against a 44.1/48 kHz
+        # device.
+        try:
+            info = sd.query_devices(device_id)
+            sample_rate = int(round(float(info.get('default_samplerate') or 44100)))
+        except Exception:
+            sample_rate = 44100
+
+        frames: list = []
+        # current[0] is read by the Tk tick (main thread) and written by the
+        # PortAudio callback (audio thread). Reads/writes on a single list
+        # slot are atomic in CPython — no extra lock needed for a smoothed
+        # progress-bar update.
+        current = [0.0]
+        captured = threading.Event()
+
+        def cb(indata, _frames, _time, status):
+            if status:
+                logging.warning(f"PortAudio status during mic test: {status}")
+            frames.append(indata.copy())
+            rms = float(np.sqrt(np.mean(indata ** 2)))
+            # smooth (matches AudioRecorder's visualization curve)
+            current[0] = current[0] * 0.3 + min(1.0, rms * 5) * 0.7
+
+        # Drive a periodic UI tick — progress bar only, status text already set
+        def tick():
+            if captured.is_set():
+                return
+            try:
+                self.test_level.set(current[0])
+            except Exception:
+                return
+            self.after(50, tick)
+
+        self.after(0, tick)
 
         try:
-            import sounddevice as sd
-            import numpy as np
-
-            selected_idx = self._get_selected_mic_index()
-            if selected_idx >= 0 and selected_idx < len(self.microphones):
-                device_id = self.microphones[selected_idx]['id']
-            else:
-                device_id = None
-
-            duration = 0.5
-            recording = sd.rec(
-                int(duration * 16000),
-                samplerate=16000,
+            with sd.InputStream(
+                samplerate=sample_rate,
                 channels=1,
+                dtype=np.float32,
+                callback=cb,
                 device=device_id,
-                dtype=np.float32
-            )
-            sd.wait()
-
-            max_amplitude = np.max(np.abs(recording))
-            if max_amplitude > 0.01:
-                self.test_status.configure(text="✓ Микрофон работает!", text_color="green")
-            else:
-                self.test_status.configure(text="⚠ Сигнал слабый", text_color="orange")
-
+                blocksize=1024,
+            ):
+                time.sleep(duration)
         except Exception as e:
-            self.test_status.configure(text=f"✗ Ошибка: {str(e)[:30]}", text_color="red")
+            captured.set()
+            err = str(e)[:80]
+            self.after(0, lambda: self.test_status.configure(
+                text=f"✗ Не удалось открыть микрофон: {err}", text_color="red"
+            ))
+            self._finish_test(reset_level=True)
+            return
 
-        self.after(3000, lambda: self.test_status.configure(text="", text_color="white"))
+        captured.set()
+
+        if not frames:
+            self.after(0, lambda: self.test_status.configure(
+                text="✗ Аудио не получено", text_color="orange"
+            ))
+            self._finish_test(reset_level=True)
+            return
+
+        audio = np.concatenate(frames, axis=0).reshape(-1)
+        peak = float(np.max(np.abs(audio)))
+        peak_db = 20.0 * np.log10(peak) if peak > 1e-9 else -100.0
+
+        # Playback the captured audio so the user hears whether it sounds OK.
+        # If playback fails (no default output, exclusive mode etc.) — that's
+        # not a mic failure, log and continue to the verdict.
+        self.after(0, lambda: self.test_status.configure(
+            text="Воспроизведение записи…", text_color="white"
+        ))
+        try:
+            sd.play(audio, samplerate=sample_rate)
+            sd.wait()
+        except Exception as e:
+            logging.warning(f"Mic test playback failed: {e}")
+
+        # Verdict thresholds tuned for speech RMS on a USB condenser mic:
+        # <-40 dB peak ≈ near-silent, -40 .. -20 quiet but usable,
+        # -20 .. -3 healthy, > -1 likely clipping.
+        if peak < 0.01:
+            verdict = (
+                f"⚠ Очень тихо: peak {peak_db:.1f} dB. "
+                f"Проверьте, что выбран нужный микрофон и не убран gain в Windows."
+            )
+            color = "orange"
+        elif peak < 0.1:
+            verdict = f"✓ Сигнал слабый, но есть · peak {peak_db:.1f} dB · {sample_rate} Hz"
+            color = "#E0CC7C"
+        elif peak < 0.9:
+            verdict = f"✓ OK · peak {peak_db:.1f} dB · {sample_rate} Hz · «{device_name}»"
+            color = "#7CE08B"
+        else:
+            verdict = (
+                f"⚠ Слишком громко: peak {peak_db:.1f} dB — возможно клиппинг. "
+                f"Уменьшите gain в Windows."
+            )
+            color = "orange"
+
+        self.after(0, lambda v=verdict, c=color: self.test_status.configure(
+            text=v, text_color=c
+        ))
+        self._finish_test(reset_level=False)
+
+    def _finish_test(self, reset_level: bool):
+        """Re-enable the button, optionally clear the level bar."""
+        def apply():
+            self.test_btn.configure(state="normal")
+            if reset_level:
+                self.test_level.set(0)
+        self.after(0, apply)
+        self._test_in_progress = False
 
     # ===== Hotkey recording =====
 
