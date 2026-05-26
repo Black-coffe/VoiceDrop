@@ -756,9 +756,23 @@ class VoiceDropApp:
         if self.history_window is None:
             self.history_window = HistoryWindow(
                 self._root,
-                on_copy_callback=self.text_inserter.copy_to_clipboard
+                on_copy_callback=self.text_inserter.copy_to_clipboard,
+                usage_provider=self._usage_snapshot,
+                balance_provider=self.elevenlabs_client.get_subscription,
             )
         self.history_window.show()
+
+    def _usage_snapshot(self) -> dict:
+        """Today + month-to-date local usage, evaluated each refresh so a
+        live setting change to stt_cost_per_hour takes effect immediately."""
+        rate = load_settings().get('stt_cost_per_hour', 0.40)
+        try:
+            rate = float(rate)
+        except (TypeError, ValueError):
+            rate = 0.40
+        s = self.usage.summary(cost_per_hour=rate)
+        m = self.usage.month_summary(cost_per_hour=rate)
+        return {**s, **m, "cost_per_hour": rate}
 
     def _show_settings(self):
         """Show settings window"""

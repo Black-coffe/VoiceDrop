@@ -100,10 +100,29 @@ def _period_to_range(label: str) -> tuple[Optional[datetime], Optional[datetime]
 
 
 class HistoryWindow(ctk.CTkToplevel):
-    def __init__(self, parent=None, on_copy_callback: Optional[Callable[[str], None]] = None):
+    def __init__(
+        self,
+        parent=None,
+        on_copy_callback: Optional[Callable[[str], None]] = None,
+        usage_provider: Optional[Callable[[], dict]] = None,
+        balance_provider: Optional[Callable[[], Optional[dict]]] = None,
+    ):
+        """
+        Args:
+            usage_provider: returns a dict with today_min/today_cost/month_min/
+                month_cost/cost_per_hour for the bottom-row metrics. None →
+                metrics row is hidden.
+            balance_provider: returns the ElevenLabs subscription dict (used/
+                limit/reset_unix) or None on failure. None → balance is shown
+                as "—".
+        """
         super().__init__(parent)
 
         self.on_copy_callback = on_copy_callback
+        self._usage_provider = usage_provider
+        self._balance_provider = balance_provider
+        self._metrics_after_id: Optional[str] = None
+
         self.db = DatabaseManager()
 
         self.title("VoiceDrop - История записей")
@@ -198,11 +217,28 @@ class HistoryWindow(ctk.CTkToplevel):
         self.scroll_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(5, 10))
         self.scroll_frame.grid_columnconfigure(0, weight=1)
 
-        # ── Status bar ────────────────────────────────────────────────────
-        self.status_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=12))
-        self.status_label.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        # ── Status bar (two columns: count/period left, usage/balance right) ─
+        status_frame = ctk.CTkFrame(self, fg_color="transparent")
+        status_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        status_frame.grid_columnconfigure(0, weight=1)
+        status_frame.grid_columnconfigure(1, weight=1)
+
+        self.status_label = ctk.CTkLabel(
+            status_frame, text="", font=ctk.CTkFont(size=12), anchor="w",
+        )
+        self.status_label.grid(row=0, column=0, sticky="ew")
+
+        self.metrics_label = ctk.CTkLabel(
+            status_frame,
+            text="",
+            font=ctk.CTkFont(size=12),
+            anchor="e",
+            text_color="#9BB8E0",
+        )
+        self.metrics_label.grid(row=0, column=1, sticky="ew")
 
         self.refresh_list()
+        self._refresh_metrics()
         self.protocol("WM_DELETE_WINDOW", self.hide)
 
     # ── Data loading ──────────────────────────────────────────────────────
@@ -377,6 +413,74 @@ class HistoryWindow(ctk.CTkToplevel):
         )
         copy_btn.grid(row=0, column=2, padx=10, pady=8, sticky="n" if is_latest else "")
 
+    # ── Metrics row (ElevenLabs balance + today/month usage) ─────────────
+    def _refresh_metrics(self):
+        """Update the right-side status line. Re-schedules itself every 60s
+        while the window is visible. Both providers are tolerant of None /
+        offline — we degrade to dashes rather than throwing."""
+        if not hasattr(self, 'metrics_label'):
+            return  # widgets not built yet
+        try:
+            text = self._build_metrics_text()
+        except Exception as e:
+            text = ""
+            # Don't spam: log once at warning level
+            import logging
+            logging.warning(f"metrics refresh failed: {e}", exc_info=True)
+        self.metrics_label.configure(text=text)
+        # Schedule next tick only if the window is currently shown.
+        try:
+            if self.winfo_viewable():
+                self._metrics_after_id = self.after(60000, self._refresh_metrics)
+            else:
+                self._metrics_after_id = None
+        except tk.TclError:
+            self._metrics_after_id = None
+
+    def _build_metrics_text(self) -> str:
+        parts: list[str] = []
+
+        # Local "today" + month-to-date (always available, no network)
+        if self._usage_provider is not None:
+            try:
+                u = self._usage_provider() or {}
+            except Exception:
+                u = {}
+            t_min = u.get("today_min", 0.0)
+            t_cost = u.get("today_cost", 0.0)
+            m_min = u.get("month_min", 0.0)
+            m_cost = u.get("month_cost", 0.0)
+            parts.append(f"Сегодня {t_min:.1f} мин (≈${t_cost:.2f})")
+            parts.append(f"Месяц {m_min:.1f} мин (≈${m_cost:.2f})")
+
+        # Remote subscription balance — best-effort
+        if self._balance_provider is not None:
+            try:
+                b = self._balance_provider()
+            except Exception:
+                b = None
+            if b is None:
+                parts.append("Баланс: —")
+            else:
+                used = int(b.get("used") or 0)
+                limit = int(b.get("limit") or 0)
+                used_s = f"{used:,}".replace(",", " ")
+                if limit > 0:
+                    limit_s = f"{limit:,}".replace(",", " ")
+                    balance = f"Баланс {used_s} / {limit_s} кр."
+                else:
+                    balance = f"Баланс {used_s} кр."
+                reset = b.get("reset_unix")
+                if reset:
+                    try:
+                        reset_dt = datetime.fromtimestamp(int(reset))
+                        balance += f" (до {reset_dt:%d.%m})"
+                    except (ValueError, TypeError, OSError):
+                        pass
+                parts.append(balance)
+
+        return "  ·  ".join(parts)
+
     # ── Actions ───────────────────────────────────────────────────────────
     def _clear_history(self):
         if messagebox.askyesno(
@@ -425,9 +529,25 @@ class HistoryWindow(ctk.CTkToplevel):
 
     def show(self):
         self.refresh_list()
+        # Metrics row gets a fresh fetch on every open. _refresh_metrics
+        # will then re-schedule itself every 60 s for as long as the window
+        # stays visible — see _refresh_metrics().
+        if self._metrics_after_id is not None:
+            try:
+                self.after_cancel(self._metrics_after_id)
+            except Exception:
+                pass
+            self._metrics_after_id = None
         self.deiconify()
         self.lift()
         self.focus_force()
+        self._refresh_metrics()
 
     def hide(self):
+        if self._metrics_after_id is not None:
+            try:
+                self.after_cancel(self._metrics_after_id)
+            except Exception:
+                pass
+            self._metrics_after_id = None
         self.withdraw()

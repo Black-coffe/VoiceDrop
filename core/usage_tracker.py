@@ -77,3 +77,19 @@ class UsageTracker:
             "total_cost": cost(self._data["total_audio_ms"]),
             "total_chars": self._data["total_chars"],
         }
+
+    def month_summary(self, cost_per_hour: float = 0.40) -> dict:
+        """Aggregate usage for the current calendar month so far (LOCAL date)."""
+        prefix = date.today().strftime("%Y-%m-")
+        m_requests = 0
+        m_audio_ms = 0
+        for day_key, day in self._data["days"].items():
+            if not day_key.startswith(prefix):
+                continue
+            m_requests += int(day.get("requests", 0) or 0)
+            m_audio_ms += int(day.get("audio_ms", 0) or 0)
+        return {
+            "month_requests": m_requests,
+            "month_min": m_audio_ms / 60000.0,
+            "month_cost": (m_audio_ms / 3_600_000.0) * cost_per_hour,
+        }

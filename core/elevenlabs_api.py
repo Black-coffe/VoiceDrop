@@ -58,6 +58,9 @@ class TranscriptionError(Exception):
         self.retryable = retryable
 
 
+_SUBSCRIPTION_CACHE_SEC = 300.0  # don't re-poll /v1/user/subscription more often
+
+
 class ElevenLabsClient:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or ELEVENLABS_API_KEY
@@ -65,6 +68,10 @@ class ElevenLabsClient:
         self.last_language_code: Optional[str] = None  # language scribe detected last
         self.max_retries = _MAX_RETRIES
         self.timeout = _TIMEOUT
+        # Cached snapshot of /v1/user/subscription. The endpoint changes only
+        # when something is billed, so 5 min is plenty fresh for the UI.
+        self._subscription_cache: Optional[dict] = None
+        self._subscription_cache_at: float = 0.0
 
     def configure(self, max_retries: Optional[int] = None,
                   read_timeout: Optional[float] = None):
@@ -212,6 +219,63 @@ class ElevenLabsClient:
             if text:
                 msg += f" - {text}"
         return TranscriptionError(msg, retryable=retryable)
+
+    def get_subscription(self, force: bool = False) -> Optional[dict]:
+        """Fetch /v1/user/subscription (cached). Returns a small flat dict or None.
+
+        Fields surfaced for the UI:
+          used       — character_count consumed in the current billing period
+          limit      — character_limit for the current billing period
+          reset_unix — next_character_count_reset_unix (UTC seconds, or None)
+          tier       — plan tier (e.g. 'free', 'creator', 'pro')
+          status     — subscription status string
+
+        STT minutes get converted into this same character/credit pool on the
+        server side; the exact ratio isn't documented, so we display the raw
+        credits and let the user reason about it.
+        """
+        if not self.api_key:
+            return None
+        now = time.time()
+        if (not force
+                and self._subscription_cache is not None
+                and (now - self._subscription_cache_at) < _SUBSCRIPTION_CACHE_SEC):
+            return self._subscription_cache
+
+        try:
+            client = self._get_client()
+            response = client.get(
+                "https://api.elevenlabs.io/v1/user/subscription",
+                headers={"xi-api-key": self.api_key},
+            )
+        except httpx.HTTPError as e:
+            # Offline / transient — keep the previous cache if we have one.
+            logging.warning(f"Subscription fetch failed (network): {e}")
+            return self._subscription_cache
+
+        if response.status_code != 200:
+            logging.warning(
+                f"Subscription fetch failed: HTTP {response.status_code} "
+                f"{response.text[:200]}"
+            )
+            return self._subscription_cache
+
+        try:
+            data = response.json()
+        except ValueError as e:
+            logging.warning(f"Subscription response not JSON: {e}")
+            return self._subscription_cache
+
+        snapshot = {
+            "used": int(data.get("character_count") or 0),
+            "limit": int(data.get("character_limit") or 0),
+            "reset_unix": data.get("next_character_count_reset_unix"),
+            "tier": data.get("tier"),
+            "status": data.get("status"),
+        }
+        self._subscription_cache = snapshot
+        self._subscription_cache_at = now
+        return snapshot
 
     def close(self):
         """Close the HTTP client"""
