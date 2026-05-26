@@ -1,6 +1,8 @@
 """
 Database Manager - SQLite storage for voice recordings history
 """
+import logging
+import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta
@@ -49,7 +51,7 @@ class DatabaseManager:
         return self._local.connection
 
     def _init_db(self):
-        """Initialize database schema"""
+        """Initialize database schema, FTS5 mirror, and one-time backfill."""
         conn = self._get_connection()
         conn.execute("""
             CREATE TABLE IF NOT EXISTS recordings (
@@ -63,6 +65,46 @@ class DatabaseManager:
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_created_at ON recordings(created_at)
         """)
+        # FTS5 contentless-external index over recordings.text. Uses unicode61
+        # tokenizer with diacritic-folding so RU/UK search works regardless of
+        # 'й' vs 'и', accent marks, etc. Kept in sync with the base table via
+        # triggers below; on first run the existing rows are backfilled.
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS recordings_fts USING fts5(
+                text,
+                content='recordings',
+                content_rowid='id',
+                tokenize='unicode61 remove_diacritics 2'
+            )
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS recordings_ai_fts AFTER INSERT ON recordings BEGIN
+                INSERT INTO recordings_fts(rowid, text) VALUES (new.id, new.text);
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS recordings_ad_fts AFTER DELETE ON recordings BEGIN
+                INSERT INTO recordings_fts(recordings_fts, rowid, text) VALUES('delete', old.id, old.text);
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS recordings_au_fts AFTER UPDATE ON recordings BEGIN
+                INSERT INTO recordings_fts(recordings_fts, rowid, text) VALUES('delete', old.id, old.text);
+                INSERT INTO recordings_fts(rowid, text) VALUES (new.id, new.text);
+            END
+        """)
+        # One-time backfill on schema upgrade: if FTS has fewer docs than the
+        # base table (e.g. we just added FTS), trigger a full rebuild. The
+        # 'rebuild' command is the documented way to (re)populate an
+        # external-content FTS5 table — manual bulk INSERTs register the
+        # rowids but don't actually tokenize the text.
+        fts_count = conn.execute("SELECT COUNT(*) FROM recordings_fts").fetchone()[0]
+        rec_count = conn.execute("SELECT COUNT(*) FROM recordings").fetchone()[0]
+        if fts_count < rec_count:
+            conn.execute(
+                "INSERT INTO recordings_fts(recordings_fts) VALUES ('rebuild')"
+            )
+            logging.info(f"FTS5 rebuilt for {rec_count} recordings (was {fts_count})")
         conn.commit()
 
     def save_recording(self, text: str, audio_duration_ms: int = 0, was_inserted: bool = True) -> int:
@@ -99,14 +141,73 @@ class DatabaseManager:
         return [dict(row) for row in cursor.fetchall()]
 
     def search_recordings(self, query: str, limit: int = 300) -> list[dict]:
-        """Search recordings whose text contains query (case-insensitive)."""
+        """Full-text search using FTS5; LIKE fallback for queries FTS can't parse.
+
+        Each whitespace-separated token gets a `*` prefix-match, joined by
+        implicit AND. So "бэкап goog" matches "...бэкап на Google Диск...".
+        Empty/whitespace-only query returns no results.
+        """
+        # Tokenize: keep only word chars (covers Cyrillic via \w + UNICODE).
+        # This also strips any FTS operator characters (", *, OR, NOT) that
+        # would otherwise let a stray quote crash the parser.
+        tokens = re.findall(r"\w+", query, flags=re.UNICODE)
+        if not tokens:
+            return []
+        match_query = " ".join(f"{t}*" for t in tokens)
+
         conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                """
+                SELECT r.id, r.text, r.created_at, r.audio_duration_ms, r.was_inserted
+                FROM recordings r
+                JOIN recordings_fts f ON f.rowid = r.id
+                WHERE recordings_fts MATCH ?
+                ORDER BY r.created_at DESC
+                LIMIT ?
+                """,
+                (match_query, limit)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.OperationalError as e:
+            # FTS5 not available, or a query the parser rejected despite the
+            # sanitisation. Fall back to plain LIKE so the user still gets
+            # SOMETHING rather than an opaque empty result.
+            logging.warning(f"FTS search failed, falling back to LIKE: {e}")
+            cursor = conn.execute(
+                """
+                SELECT id, text, created_at, audio_duration_ms, was_inserted
+                FROM recordings WHERE text LIKE ? ORDER BY created_at DESC LIMIT ?
+                """,
+                (f"%{query}%", limit)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_recordings_in_range(
+        self,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        limit: int = 5000,
+    ) -> list[dict]:
+        """Recordings whose created_at is within [start, end]. None = open-ended."""
+        conn = self._get_connection()
+        clauses = []
+        params: list = []
+        if start is not None:
+            clauses.append("created_at >= ?")
+            params.append(start.isoformat())
+        if end is not None:
+            clauses.append("created_at <= ?")
+            params.append(end.isoformat())
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
         cursor = conn.execute(
-            """
+            f"""
             SELECT id, text, created_at, audio_duration_ms, was_inserted
-            FROM recordings WHERE text LIKE ? ORDER BY created_at DESC LIMIT ?
+            FROM recordings {where}
+            ORDER BY created_at DESC LIMIT ?
             """,
-            (f"%{query}%", limit)
+            params,
         )
         return [dict(row) for row in cursor.fetchall()]
 
