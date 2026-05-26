@@ -276,13 +276,14 @@ class HistoryWindow(ctk.CTkToplevel):
         return None
 
     def _fetch_records(self) -> tuple[list[dict], str]:
-        """Return (records, subtitle) for the current search/period/date state."""
-        query = self.search_entry.get().strip() if hasattr(self, 'search_entry') else ""
-        if query:
-            records = self.db.search_recordings(query, limit=_LIST_LIMIT)
-            return records, f"найдено по «{query}»"
-
-        # Explicit date entries beat the preset combo when at least one parses.
+        """Return (records, subtitle) honoring BOTH the active date scope and
+        the search text simultaneously. Resolution order:
+          1. Compute (start, end, range_descr) — explicit "с / по" wins;
+             otherwise the preset combo; otherwise "all time".
+          2. If the search box is non-empty: FTS within [start, end].
+          3. Else: pure date-range query.
+        """
+        # 1) Active date scope ------------------------------------------------
         from_dt = self._parse_user_date(
             self.from_entry.get() if hasattr(self, 'from_entry') else ""
         )
@@ -291,23 +292,34 @@ class HistoryWindow(ctk.CTkToplevel):
             end_of_day=True,
         )
         if from_dt or to_dt:
-            records = self.db.get_recordings_in_range(
-                start=from_dt, end=to_dt, limit=_LIST_LIMIT
-            )
+            start, end = from_dt, to_dt
             parts = []
             if from_dt:
                 parts.append(f"с {from_dt:%d.%m.%Y}")
             if to_dt:
                 parts.append(f"по {to_dt:%d.%m.%Y}")
-            return records, "произвольный · " + " ".join(parts)
+            range_descr = "произвольный · " + " ".join(parts)
+        else:
+            period = self.period_var.get() if hasattr(self, 'period_var') else _DEFAULT_PERIOD
+            start, end = _period_to_range(period)
+            if start is None and end is None:
+                range_descr = "все записи"
+            else:
+                range_descr = f"период: {period.lower()}"
 
-        period = self.period_var.get() if hasattr(self, 'period_var') else _DEFAULT_PERIOD
-        start, end = _period_to_range(period)
-        if start is None and end is None:
-            records = self.db.get_recordings_in_range(limit=_LIST_LIMIT)
-            return records, "все записи"
-        records = self.db.get_recordings_in_range(start=start, end=end, limit=_LIST_LIMIT)
-        return records, f"период: {period.lower()}"
+        # 2) Search inside that scope ----------------------------------------
+        query = self.search_entry.get().strip() if hasattr(self, 'search_entry') else ""
+        if query:
+            records = self.db.search_recordings(
+                query, start=start, end=end, limit=_LIST_LIMIT
+            )
+            return records, f"«{query}» · {range_descr}"
+
+        # 3) Pure range -------------------------------------------------------
+        records = self.db.get_recordings_in_range(
+            start=start, end=end, limit=_LIST_LIMIT
+        )
+        return records, range_descr
 
     def refresh_list(self):
         """Refresh the recordings list with current search/period filters."""
@@ -404,14 +416,32 @@ class HistoryWindow(ctk.CTkToplevel):
         )
         text_label.grid(row=0, column=1, sticky="ew", padx=5, pady=(10 if is_latest else 8))
 
+        # Actions cluster: Copy + small ✕ delete on the right edge of the row.
+        actions = ctk.CTkFrame(frame, fg_color="transparent")
+        actions.grid(row=0, column=2, padx=(5, 10), pady=8, sticky="n" if is_latest else "")
+
         copy_btn = ctk.CTkButton(
-            frame,
+            actions,
             text="Копировать",
             width=90,
             height=28,
             command=lambda t=text: self._copy_text(t),
         )
-        copy_btn.grid(row=0, column=2, padx=10, pady=8, sticky="n" if is_latest else "")
+        copy_btn.grid(row=0, column=0, padx=(0, 4))
+
+        rec_id = recording.get('id')
+        del_btn = ctk.CTkButton(
+            actions,
+            text="✕",
+            width=28,
+            height=28,
+            fg_color="transparent",
+            border_width=1,
+            border_color="#5A3030",
+            hover_color="#8B2E2E",
+            command=lambda rid=rec_id, txt=text: self._delete_recording(rid, txt),
+        )
+        del_btn.grid(row=0, column=1)
 
     # ── Metrics row (ElevenLabs balance + today/month usage) ─────────────
     def _refresh_metrics(self):
@@ -491,6 +521,28 @@ class HistoryWindow(ctk.CTkToplevel):
             self.db.clear_all()
             self.refresh_list()
             self.status_label.configure(text="История очищена")
+
+    def _delete_recording(self, rec_id: Optional[int], preview_text: str):
+        """Remove one recording after a small confirm dialog. The FTS5 DELETE
+        trigger keeps the search index in sync, so no extra cleanup needed."""
+        if rec_id is None:
+            return
+        snippet = (preview_text or "").strip().replace("\n", " ")
+        if len(snippet) > 80:
+            snippet = snippet[:80] + "…"
+        if not messagebox.askyesno(
+            "Удалить запись",
+            f"Удалить эту запись?\n\n«{snippet}»",
+            parent=self,
+        ):
+            return
+        try:
+            self.db.delete_recording(int(rec_id))
+        except Exception as e:
+            self.status_label.configure(text=f"Не удалось удалить: {e}")
+            return
+        self.refresh_list()
+        self.status_label.configure(text="Запись удалена")
 
     def _export(self):
         recordings = self.db.get_all_recordings(limit=100000)

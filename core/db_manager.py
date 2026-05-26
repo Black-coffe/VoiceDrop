@@ -156,12 +156,21 @@ class DatabaseManager:
             )
         return [dict(row) for row in cursor.fetchall()]
 
-    def search_recordings(self, query: str, limit: int = 300) -> list[dict]:
-        """Full-text search using FTS5; LIKE fallback for queries FTS can't parse.
+    def search_recordings(
+        self,
+        query: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        limit: int = 300,
+    ) -> list[dict]:
+        """Full-text search using FTS5, optionally scoped to a date range.
 
-        Each whitespace-separated token gets a `*` prefix-match, joined by
-        implicit AND. So "бэкап goog" matches "...бэкап на Google Диск...".
-        Empty/whitespace-only query returns no results.
+        Each whitespace-separated token in `query` gets a `*` prefix-match,
+        joined by implicit AND. So "бэкап goog" matches "...бэкап на Google
+        Диск...". Empty/whitespace-only query returns no results. When
+        `start` / `end` are given, results are restricted to that window
+        (local datetimes; converted to DB UTC text via _to_db_string).
+        Falls back to plain LIKE if FTS rejects the query.
         """
         # Tokenize: keep only word chars (covers Cyrillic via \w + UNICODE).
         # This also strips any FTS operator characters (", *, OR, NOT) that
@@ -171,18 +180,28 @@ class DatabaseManager:
             return []
         match_query = " ".join(f"{t}*" for t in tokens)
 
+        date_clauses: list[str] = []
+        date_params: list = []
+        if start is not None:
+            date_clauses.append("r.created_at >= ?")
+            date_params.append(_to_db_string(start))
+        if end is not None:
+            date_clauses.append("r.created_at <= ?")
+            date_params.append(_to_db_string(end))
+        date_where = (" AND " + " AND ".join(date_clauses)) if date_clauses else ""
+
         conn = self._get_connection()
         try:
             cursor = conn.execute(
-                """
+                f"""
                 SELECT r.id, r.text, r.created_at, r.audio_duration_ms, r.was_inserted
                 FROM recordings r
                 JOIN recordings_fts f ON f.rowid = r.id
-                WHERE recordings_fts MATCH ?
+                WHERE recordings_fts MATCH ?{date_where}
                 ORDER BY r.created_at DESC
                 LIMIT ?
                 """,
-                (match_query, limit)
+                [match_query, *date_params, limit]
             )
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.OperationalError as e:
@@ -190,12 +209,14 @@ class DatabaseManager:
             # sanitisation. Fall back to plain LIKE so the user still gets
             # SOMETHING rather than an opaque empty result.
             logging.warning(f"FTS search failed, falling back to LIKE: {e}")
+            like_date_where = date_where.replace("r.created_at", "created_at")
             cursor = conn.execute(
-                """
+                f"""
                 SELECT id, text, created_at, audio_duration_ms, was_inserted
-                FROM recordings WHERE text LIKE ? ORDER BY created_at DESC LIMIT ?
+                FROM recordings WHERE text LIKE ?{like_date_where}
+                ORDER BY created_at DESC LIMIT ?
                 """,
-                (f"%{query}%", limit)
+                [f"%{query}%", *date_params, limit]
             )
             return [dict(row) for row in cursor.fetchall()]
 
