@@ -2,6 +2,8 @@
 VoiceDrop - Voice to Text Application
 Main entry point
 """
+import asyncio
+import concurrent.futures
 import os
 import sys
 import threading
@@ -114,6 +116,11 @@ from core.audio_muter import AudioMuter
 from core.audio_recorder import AudioRecorder
 from core.db_manager import DatabaseManager
 from core.elevenlabs_api import ElevenLabsClient, TranscriptionError
+from core.elevenlabs_ws import (
+    END_OF_STREAM,
+    RealtimeError,
+    RealtimeTranscriber,
+)
 from core.hotkey_manager import HotkeyManager
 from core.pending_queue import PendingQueue
 from core.profiles import ProfileManager
@@ -158,6 +165,16 @@ class VoiceDropApp:
         self.voice_commands = VoiceCommands()
         self.profiles = ProfileManager()
         self.usage = UsageTracker()
+        self.realtime_transcriber = RealtimeTranscriber(ELEVENLABS_API_KEY)
+        # Dedicated asyncio loop in a daemon thread for realtime WS sessions.
+        # Created lazily on first realtime-mode press so batch users pay nothing.
+        self._rt_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._rt_thread: Optional[threading.Thread] = None
+        self._rt_loop_ready = threading.Event()
+        # Per-press state for an in-flight realtime session.
+        self._rt_chunk_queue: Optional[asyncio.Queue] = None
+        self._rt_active_future: Optional[concurrent.futures.Future] = None
+        self._rt_language: Optional[str] = None
 
         self.tray_icon: Optional[TrayIcon] = None
         self.history_window: Optional[HistoryWindow] = None
@@ -217,6 +234,91 @@ class VoiceDropApp:
         """Handle termination signals"""
         logging.warning(f"Received signal {signum}, initiating shutdown...")
         self._on_quit()
+
+    # --- Realtime STT plumbing ------------------------------------------------
+    def _get_stt_mode(self) -> str:
+        """Return 'batch' (default) or 'realtime' — read fresh each press so
+        the user can toggle in Settings without restarting."""
+        mode = (load_settings().get("stt_mode") or "batch").strip().lower()
+        return mode if mode in ("batch", "realtime") else "batch"
+
+    def _ensure_rt_loop(self):
+        """Lazily start a daemon asyncio loop for realtime WS sessions."""
+        if self._rt_loop is not None and self._rt_thread and self._rt_thread.is_alive():
+            return
+
+        def _run():
+            loop = asyncio.new_event_loop()
+            self._rt_loop = loop
+            asyncio.set_event_loop(loop)
+            self._rt_loop_ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                try:
+                    pending = asyncio.all_tasks(loop=loop)
+                    for t in pending:
+                        t.cancel()
+                except Exception:
+                    pass
+                loop.close()
+
+        self._rt_loop_ready.clear()
+        self._rt_thread = threading.Thread(target=_run, daemon=True, name="rt-loop")
+        self._rt_thread.start()
+        # Wait briefly so callers can rely on self._rt_loop being usable.
+        self._rt_loop_ready.wait(timeout=2.0)
+
+    def _stop_rt_loop(self):
+        """Best-effort shutdown of the realtime asyncio loop."""
+        loop = self._rt_loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+        if self._rt_thread and self._rt_thread.is_alive():
+            self._rt_thread.join(timeout=2.0)
+        self._rt_loop = None
+        self._rt_thread = None
+
+    async def _run_realtime_session(
+        self,
+        chunk_queue: asyncio.Queue,
+        language: Optional[str],
+    ) -> str:
+        """Bridge: forward partial_transcript to the overlay (via Tk-safe
+        ``after(0, …)``) and run the transcriber's WS session."""
+        def on_partial(text: str):
+            if self.recording_overlay and self._root:
+                try:
+                    self._root.after(
+                        0,
+                        lambda t=text: self.recording_overlay.show_polish_partial(t),
+                    )
+                except Exception:
+                    pass
+
+        return await self.realtime_transcriber.transcribe_stream(
+            chunk_queue=chunk_queue,
+            sample_rate=16000,
+            on_partial=on_partial,
+            language=language,
+        )
+
+    def _rt_enqueue_chunk(self, chunk: bytes):
+        """Audio-callback-thread → asyncio queue. Survives loop being gone."""
+        loop = self._rt_loop
+        queue = self._rt_chunk_queue
+        if loop is None or queue is None:
+            return
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, chunk)
+        except RuntimeError:
+            # Loop closed mid-recording — give up silently; release handler
+            # will surface a RealtimeError on future.result() and fall back.
+            pass
 
     def _on_hotkey_press(self):
         """Called when hotkey is pressed - start recording.
@@ -282,6 +384,38 @@ class VoiceDropApp:
             threading.Thread(
                 target=self._mute_worker, args=(session_id,), daemon=True
             ).start()
+
+            # 4) Realtime STT branch — start a WS session in the rt loop and
+            # have the audio callback push PCM16/16k chunks into its queue.
+            # Raw float32 frames keep accumulating in audio_recorder so a
+            # WS failure can still fall back to batch from the in-memory WAV.
+            if self._get_stt_mode() == "realtime":
+                try:
+                    self._ensure_rt_loop()
+                    settings = load_settings()
+                    self._rt_language = settings.get("language_code", None)
+                    # asyncio.Queue() can be constructed from any thread in
+                    # 3.10+; it captures the running loop on first .get/.put,
+                    # which will happen inside the rt loop.
+                    self._rt_chunk_queue = asyncio.Queue()
+                    self._rt_active_future = asyncio.run_coroutine_threadsafe(
+                        self._run_realtime_session(
+                            self._rt_chunk_queue, self._rt_language
+                        ),
+                        self._rt_loop,
+                    )
+                    self.audio_recorder.set_chunk_callback(self._rt_enqueue_chunk)
+                    logging.info("Realtime STT session started")
+                except Exception as e:
+                    # Don't bring down the press — log and silently fall back
+                    # to batch for this clip. The recorder keeps recording
+                    # either way.
+                    logging.warning(
+                        f"Realtime STT setup failed, this clip falls back to batch: {e}"
+                    )
+                    self._rt_active_future = None
+                    self._rt_chunk_queue = None
+                    self.audio_recorder.set_chunk_callback(None)
         except Exception as e:
             logging.error(f"Unexpected error in _on_hotkey_press: {e}", exc_info=True)
             with self._lock:
@@ -350,6 +484,13 @@ class VoiceDropApp:
             min_ms = load_settings().get('min_duration_ms', 200)
             if not audio_data or duration_ms < min_ms:  # Too short
                 logging.info("Recording too short, ignoring")
+                # If a realtime session was in flight, abort it before we
+                # leave — don't leak the WS task or the chunk callback.
+                if self._rt_active_future is not None:
+                    self.audio_recorder.set_chunk_callback(None)
+                    self._rt_active_future.cancel()
+                    self._rt_active_future = None
+                    self._rt_chunk_queue = None
                 if self.recording_overlay and self._root:
                     self._root.after(0, self.recording_overlay.hide)
                 return
@@ -358,12 +499,42 @@ class VoiceDropApp:
             forced_mode = "code" if (self.hotkey_manager and
                                      self.hotkey_manager.modifier_was_held()) else None
 
-            # Process in background thread
-            threading.Thread(
-                target=self._process_audio,
-                args=(audio_data, duration_ms, forced_mode),
-                daemon=True
-            ).start()
+            # Dispatch to the right processor — realtime session was set up
+            # in _on_hotkey_press if stt_mode == 'realtime' AND the setup
+            # succeeded. We pin to the future/queue snapshot here so a fresh
+            # press during processing can't see stale state.
+            if self._rt_active_future is not None:
+                rt_future = self._rt_active_future
+                rt_queue = self._rt_chunk_queue
+                rt_lang = self._rt_language
+                # Detach from the instance attrs immediately so a quick second
+                # press is welcome to set up its own session.
+                self._rt_active_future = None
+                self._rt_chunk_queue = None
+                self.audio_recorder.set_chunk_callback(None)
+                # Signal end-of-stream so the WS sends commit=true and waits
+                # for committed_transcript.
+                try:
+                    if self._rt_loop and rt_queue is not None:
+                        self._rt_loop.call_soon_threadsafe(
+                            rt_queue.put_nowait, END_OF_STREAM
+                        )
+                except Exception as e:
+                    logging.debug(f"Could not signal END_OF_STREAM: {e}")
+
+                threading.Thread(
+                    target=self._process_audio_realtime,
+                    args=(audio_data, duration_ms, forced_mode,
+                          rt_future, rt_lang),
+                    daemon=True,
+                ).start()
+            else:
+                # Batch path (default, unchanged).
+                threading.Thread(
+                    target=self._process_audio,
+                    args=(audio_data, duration_ms, forced_mode),
+                    daemon=True
+                ).start()
         except Exception as e:
             logging.error(f"Unexpected error in _on_hotkey_release: {e}", exc_info=True)
             try:
@@ -401,67 +572,7 @@ class VoiceDropApp:
                 return
 
             text = text.strip()
-
-            # Resolve dictation mode: hotkey modifier forces code, else the setting
-            mode = forced_mode or self._effective_mode()
-            if forced_mode == "code":
-                logging.info("Code-mode modifier held -> raw (no polish) for this clip")
-
-            # Optional LLM polish — text mode only (code mode stays verbatim).
-            # Best-effort: returns original on error.
-            if mode == "text" and self._get_polish_enabled():
-                # Stream the polish into the overlay as it arrives — UX-only,
-                # the actual paste below still uses the FINAL completed text.
-                def _on_polish_partial(partial: str):
-                    if self.recording_overlay and self._root:
-                        self._root.after(
-                            0,
-                            lambda p=partial: self.recording_overlay.show_polish_partial(p),
-                        )
-                text = self.text_polisher.polish(
-                    text, language=language, on_partial=_on_polish_partial
-                )
-            # Custom dictionary: fix tech terms / names STT mangles (local, instant)
-            text = self.text_replacer.apply(text)
-            # Voice formatting commands: "новая строка", "код блок", ... -> symbols
-            text = self.voice_commands.apply(text)
-            # Code mode: verbatim style (drop trailing period, lowercase Latin start)
-            if mode == "code":
-                text = self.profiles.apply_code_style(text)
-
-            # Show word count on overlay
-            word_count = len(text.split())
-            char_count = len(text)
-            if self.recording_overlay and self._root:
-                # Hold the final text in overlay for 800 ms so the streaming/typing
-                # effect is readable on short clips (1–2 s polish was flashing by).
-                # Then switch to the "N слов" summary and hide after another 1.5 s.
-                # Doesn't delay paste — text is already inserted above.
-                self._root.after(0, lambda t=text: self.recording_overlay.show_polish_partial(t))
-                self._root.after(800, lambda: self.recording_overlay.show_result(word_count, char_count))
-                self._root.after(800 + 1500, self.recording_overlay.hide)
-
-            self._last_text = text  # remember for "Скопировать последнее"
-
-            # Deliver text per the chosen insert mode
-            insert_mode = self._get_insert_mode()
-            if insert_mode == "clipboard":
-                self.text_inserter.copy_to_clipboard(text)
-                inserted = False
-            elif insert_mode == "enter":
-                inserted = self.text_inserter.insert_text(text, press_enter=True)
-            else:  # "window"
-                inserted = self.text_inserter.insert_text(text)
-
-            # Save to database (unless history saving is disabled for privacy)
-            if self._get_save_history():
-                self.db.save_recording(text, duration_ms, was_inserted=inserted)
-            self.usage.record(duration_ms, len(text))
-
-            # Play success sound
-            winsound.Beep(800, 100)  # Short high-pitched beep
-
-            logging.info(f"Done! Text: {text}")
+            self._finish_text(text, audio_data, duration_ms, forced_mode, language)
 
         except TranscriptionError as e:
             # Transcription failed after retries. Queue it for auto-resend if the
@@ -506,6 +617,177 @@ class VoiceDropApp:
             # Release the press-gate so the next hotkey press is accepted.
             with self._lock:
                 self._is_processing = False
+
+    def _finish_text(self, text: str, audio_data: bytes, duration_ms: int,
+                     forced_mode: Optional[str], language: Optional[str]):
+        """Post-STT pipeline shared by batch and realtime paths.
+
+        Takes a non-empty, stripped transcript and runs: polish → dictionary
+        → voice commands → code-style → overlay → insert → history → usage.
+        ``audio_data`` is only kept on the instance for "Переписать последнее";
+        it's NOT re-uploaded here.
+        """
+        # Resolve dictation mode: hotkey modifier forces code, else the setting
+        mode = forced_mode or self._effective_mode()
+        if forced_mode == "code":
+            logging.info("Code-mode modifier held -> raw (no polish) for this clip")
+
+        # Optional LLM polish — text mode only (code mode stays verbatim).
+        # Best-effort: returns original on error.
+        if mode == "text" and self._get_polish_enabled():
+            # Stream the polish into the overlay as it arrives — UX-only,
+            # the actual paste below still uses the FINAL completed text.
+            def _on_polish_partial(partial: str):
+                if self.recording_overlay and self._root:
+                    self._root.after(
+                        0,
+                        lambda p=partial: self.recording_overlay.show_polish_partial(p),
+                    )
+            text = self.text_polisher.polish(
+                text, language=language, on_partial=_on_polish_partial
+            )
+        # Custom dictionary: fix tech terms / names STT mangles (local, instant)
+        text = self.text_replacer.apply(text)
+        # Voice formatting commands: "новая строка", "код блок", ... -> symbols
+        text = self.voice_commands.apply(text)
+        # Code mode: verbatim style (drop trailing period, lowercase Latin start)
+        if mode == "code":
+            text = self.profiles.apply_code_style(text)
+
+        # Show word count on overlay
+        word_count = len(text.split())
+        char_count = len(text)
+        if self.recording_overlay and self._root:
+            # Hold the final text in overlay for 800 ms so the streaming/typing
+            # effect is readable on short clips (1–2 s polish was flashing by).
+            # Then switch to the "N слов" summary and hide after another 1.5 s.
+            # Doesn't delay paste — text is already inserted above.
+            self._root.after(0, lambda t=text: self.recording_overlay.show_polish_partial(t))
+            self._root.after(800, lambda: self.recording_overlay.show_result(word_count, char_count))
+            self._root.after(800 + 1500, self.recording_overlay.hide)
+
+        self._last_text = text  # remember for "Скопировать последнее"
+
+        # Deliver text per the chosen insert mode
+        insert_mode = self._get_insert_mode()
+        if insert_mode == "clipboard":
+            self.text_inserter.copy_to_clipboard(text)
+            inserted = False
+        elif insert_mode == "enter":
+            inserted = self.text_inserter.insert_text(text, press_enter=True)
+        else:  # "window"
+            inserted = self.text_inserter.insert_text(text)
+
+        # Save to database (unless history saving is disabled for privacy)
+        if self._get_save_history():
+            self.db.save_recording(text, duration_ms, was_inserted=inserted)
+        self.usage.record(duration_ms, len(text))
+
+        # Play success sound
+        winsound.Beep(800, 100)  # Short high-pitched beep
+
+        logging.info(f"Done! Text: {text}")
+
+    def _process_audio_realtime(self, audio_data: bytes, duration_ms: int,
+                                forced_mode: Optional[str],
+                                rt_future: concurrent.futures.Future,
+                                language: Optional[str]):
+        """Wait for the realtime WS session to deliver a committed transcript,
+        then run the same post-STT pipeline as batch.
+
+        On ANY realtime failure (RealtimeError or future timeout) we save the
+        in-memory WAV to ``pending/`` so the 45-second scheduler worker will
+        retry via batch — exact same fallback as ``TranscriptionError``. No
+        audio is ever lost.
+        """
+        self._last_audio_data = audio_data
+        self._last_duration_ms = duration_ms
+        with self._lock:
+            self._is_processing = True
+        try:
+            try:
+                # The transcribe coroutine includes its own commit grace
+                # timeout (~8 s), but we wrap concurrently so a hung WS can
+                # never wedge the processing thread forever.
+                text = rt_future.result(timeout=15.0)
+            except concurrent.futures.TimeoutError as e:
+                logging.warning(
+                    "Realtime future timeout, falling back to pending+batch"
+                )
+                rt_future.cancel()
+                self._queue_for_batch_retry(
+                    audio_data, duration_ms, language,
+                    title="VoiceDrop — realtime таймаут",
+                    reason="Realtime-распознавание не успело. Дошлём через очередь.",
+                )
+                return
+            except RealtimeError as e:
+                logging.warning(f"Realtime failed ({e}); falling back to pending+batch")
+                if e.retryable:
+                    self._queue_for_batch_retry(
+                        audio_data, duration_ms, language,
+                        title="VoiceDrop — realtime",
+                        reason=(
+                            "Нет сети для realtime — дошлём через очередь."
+                            if e.offline else
+                            "Real-time не сработал — отправим через очередь."
+                        ),
+                    )
+                else:
+                    # Non-retryable (e.g. 401/403, input_error): batch wouldn't
+                    # help. Surface the error to the user, drop the clip.
+                    winsound.Beep(300, 200)
+                    if self.recording_overlay and self._root:
+                        self._root.after(
+                            0,
+                            lambda: self.recording_overlay.show_error(
+                                "Realtime: нет доступа"
+                            ),
+                        )
+                        self._root.after(2500, self.recording_overlay.hide)
+                    if self.tray_icon:
+                        self.tray_icon.show_notification(
+                            "VoiceDrop — realtime", str(e)
+                        )
+                return
+
+            text = (text or "").strip()
+            if not text:
+                logging.info("Realtime returned empty transcript")
+                if self.recording_overlay and self._root:
+                    self._root.after(0, self.recording_overlay.hide)
+                return
+            logging.info(f"Realtime transcript ({duration_ms} ms): {text[:80]}...")
+            self._finish_text(text, audio_data, duration_ms, forced_mode, language)
+
+        except Exception as e:
+            logging.error(f"Error processing realtime audio: {e}", exc_info=True)
+            winsound.Beep(300, 200)
+            if self.recording_overlay and self._root:
+                self._root.after(0, self.recording_overlay.hide)
+            if self.tray_icon:
+                self.tray_icon.show_notification("VoiceDrop — ошибка", str(e))
+        finally:
+            with self._lock:
+                self._is_processing = False
+
+    def _queue_for_batch_retry(self, audio_data: bytes, duration_ms: int,
+                               language: Optional[str], title: str, reason: str):
+        """Drop the clip into ``pending/`` so the scheduler retries via batch."""
+        queued = False
+        try:
+            queued = self.pending_queue.enqueue(
+                audio_data, duration_ms, language
+            ) is not None
+        except Exception as e:
+            logging.error(f"pending_queue.enqueue failed: {e}", exc_info=True)
+        msg = reason if queued else f"{reason} (не удалось сохранить в очередь)"
+        winsound.Beep(300, 200)
+        if self.recording_overlay and self._root:
+            self._root.after(0, lambda m=msg: self.recording_overlay.show_error(m))
+            self._root.after(2500, self.recording_overlay.hide)
+        if self.tray_icon:
+            self.tray_icon.show_notification(title, msg)
 
     def _process_pending_queue(self):
         """Resend recordings that failed transcription earlier (offline / outage).
@@ -866,6 +1148,12 @@ class VoiceDropApp:
             self.text_polisher.close()
         except Exception as e:
             logging.error(f"Error closing text polisher: {e}")
+
+        # Tear down the realtime asyncio loop (no-op if never started).
+        try:
+            self._stop_rt_loop()
+        except Exception as e:
+            logging.error(f"Error stopping realtime loop: {e}")
 
         try:
             self.db.close()

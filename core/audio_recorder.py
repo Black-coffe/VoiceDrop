@@ -31,6 +31,13 @@ _HOSTAPI_PRIORITY = {
 _OPEN_MAX_ATTEMPTS = 2
 _OPEN_RETRY_SETTLE_SEC = 0.18
 
+# Target rate for the realtime WS chunk callback. Scribe v2 Realtime is happy
+# with 16/24/44.1/48 kHz, but 16 kHz minimizes the JSON+base64 payload on the
+# wire (44.1 → 16 is 2.75× less bytes) and matches the model's native rate.
+# Resampling is in-place via numpy linear interpolation — sub-millisecond on
+# a 1024-frame block, so it fits in the PortAudio callback budget.
+_RT_TARGET_SR = 16000
+
 
 class AudioRecorder:
     def __init__(self):
@@ -53,6 +60,12 @@ class AudioRecorder:
         self._current_level: float = 0.0
         self._level_lock = threading.Lock()
 
+        # Optional realtime-STT chunk hook. When set, the PortAudio callback
+        # also pushes a resampled PCM16/16-kHz mono blob to this function on
+        # every block. Raw float32 frames keep accumulating in _frames so a
+        # fallback (WS dies → batch from the in-memory WAV) is always possible.
+        self._chunk_callback: Optional[Callable[[bytes], None]] = None
+
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
         """Callback for audio stream"""
         if status:
@@ -72,6 +85,43 @@ class AudioRecorder:
             with self._level_lock:
                 # Smooth the level for better visualization
                 self._current_level = self._current_level * 0.3 + normalized * 0.7
+
+            # Realtime-STT branch: push a resampled PCM16/16 kHz blob to the
+            # chunk hook. Best-effort — any exception in the hook is logged
+            # and swallowed so the main recording path is never affected.
+            cb = self._chunk_callback
+            if cb is not None:
+                try:
+                    cb(self._to_rt_pcm16(indata))
+                except Exception as e:
+                    logging.warning(f"chunk_callback failed: {e}")
+
+    def _to_rt_pcm16(self, indata: np.ndarray) -> bytes:
+        """Convert a sounddevice float32 block to PCM16 mono @16 kHz bytes.
+
+        Uses linear interpolation for the resample. On a 1024-frame block at
+        44.1 kHz this completes in well under 1 ms, comfortably within the
+        PortAudio callback budget.
+        """
+        mono = indata.reshape(-1) if indata.ndim > 1 else indata
+        if self.sample_rate == _RT_TARGET_SR:
+            resampled = mono.astype(np.float32, copy=False)
+        else:
+            new_len = max(1, int(round(len(mono) * _RT_TARGET_SR / self.sample_rate)))
+            x_old = np.linspace(0.0, 1.0, len(mono), endpoint=False)
+            x_new = np.linspace(0.0, 1.0, new_len, endpoint=False)
+            resampled = np.interp(x_new, x_old, mono).astype(np.float32)
+        pcm16 = (np.clip(resampled, -1.0, 1.0) * 32767.0).astype(np.int16)
+        return pcm16.tobytes()
+
+    def set_chunk_callback(self, callback: Optional[Callable[[bytes], None]]):
+        """Install / remove the realtime-STT chunk hook.
+
+        Pass ``None`` to disable. Safe to call between recordings; do NOT
+        call mid-recording — callback identity is captured per block, so a
+        swap mid-stream would deliver part of one clip to the new sink.
+        """
+        self._chunk_callback = callback
 
     def get_current_level(self) -> float:
         """Get current audio level (0.0 to 1.0) for visualization"""

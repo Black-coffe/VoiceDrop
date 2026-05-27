@@ -111,9 +111,11 @@ class SettingsWindow(ctk.CTkToplevel):
         self.settings = load_settings()
 
         self.title("VoiceDrop - Настройки")
-        self.geometry("500x720")
-        self.minsize(400, 680)
-        self.resizable(False, False)
+        # Bumped from 720 → 790 after the STT-mode row landed in Дополнительно;
+        # the Сохранить button was getting clipped by the window chrome.
+        self.geometry("500x790")
+        self.minsize(400, 740)
+        self.resizable(False, True)
 
         # Set window icon (need to wait for window to be created)
         self.after(200, self._set_icon)
@@ -329,9 +331,23 @@ class SettingsWindow(ctk.CTkToplevel):
 
         self.retries_label = ctk.CTkLabel(
             self.advanced_frame, text="Ретраи при сбое (0–5):", font=ctk.CTkFont(size=12))
-        self.retries_label.grid(row=3, column=0, pady=(4, 12), padx=15, sticky="w")
+        self.retries_label.grid(row=3, column=0, pady=4, padx=15, sticky="w")
         self.retries_entry = ctk.CTkEntry(self.advanced_frame, width=100)
-        self.retries_entry.grid(row=3, column=1, pady=(4, 12), padx=15, sticky="e")
+        self.retries_entry.grid(row=3, column=1, pady=4, padx=15, sticky="e")
+
+        # STT pipeline mode: batch is the well-trodden path; realtime opens a
+        # WS during recording and gets text seconds faster on long clips but
+        # has a different failure profile (we fall back to batch via pending
+        # on any error). Opt-in until proven on this user's network.
+        self.stt_mode_label = ctk.CTkLabel(
+            self.advanced_frame, text="Режим STT:", font=ctk.CTkFont(size=12))
+        self.stt_mode_label.grid(row=4, column=0, pady=(4, 12), padx=15, sticky="w")
+        self.stt_mode_seg = ctk.CTkSegmentedButton(
+            self.advanced_frame,
+            values=["Batch", "Realtime"],
+            width=180,
+        )
+        self.stt_mode_seg.grid(row=4, column=1, pady=(4, 12), padx=15, sticky="e")
 
         self._load_advanced()
 
@@ -395,6 +411,10 @@ class SettingsWindow(ctk.CTkToplevel):
         setv(self.min_dur_entry, self.settings.get('min_duration_ms', 200))
         setv(self.timeout_entry, self.settings.get('request_timeout_sec', 60))
         setv(self.retries_entry, self.settings.get('max_retries', 3))
+        # STT mode segmented control. Stored lowercase in settings; UI displays
+        # capitalized. Unknown values fall back to Batch.
+        stt_mode = (self.settings.get('stt_mode') or 'batch').strip().lower()
+        self.stt_mode_seg.set("Realtime" if stt_mode == 'realtime' else "Batch")
 
     def _load_microphones(self):
         """Load available microphones"""
@@ -742,6 +762,9 @@ class SettingsWindow(ctk.CTkToplevel):
         self.settings['min_duration_ms'] = clamp_int(self.min_dur_entry, 200, 50, 5000)
         self.settings['request_timeout_sec'] = clamp_int(self.timeout_entry, 60, 10, 180)
         self.settings['max_retries'] = clamp_int(self.retries_entry, 3, 0, 5)
+        self.settings['stt_mode'] = (
+            'realtime' if self.stt_mode_seg.get() == 'Realtime' else 'batch'
+        )
 
         # Hotkey is already saved in self.settings during recording
 

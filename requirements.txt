@@ -10,6 +10,9 @@ pyperclip>=1.8.2
 # HTTP client for ElevenLabs API
 httpx>=0.25.0
 
+# WebSocket client for ElevenLabs Scribe v2 Realtime STT (stt_mode=realtime)
+websockets>=14.0
+
 # GUI - System tray and windows
 pystray>=0.19.5
 Pillow>=10.0.0
