@@ -37,11 +37,29 @@ from websockets.exceptions import (
 WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 
 # After commit we still want a final committed_transcript event — give the
-# server a reasonable window before giving up. PoC showed ~300-400 ms.
-_COMMIT_GRACE_SEC = 8.0
+# server a reasonable window before giving up. PoC showed ~300-400 ms; long
+# clips with batched send can take longer to fully drain.
+_COMMIT_GRACE_SEC = 12.0
 # Connection establishment timeout. Cold TLS to api.elevenlabs.io is well
 # under 1s in healthy paths.
 _CONNECT_TIMEOUT_SEC = 6.0
+# Coalesce small PCM blocks from the PortAudio callback (one per ~23 ms
+# at 44.1 kHz / 1024 blocksize) into ~100 ms WS messages. Without this,
+# on a 54-second clip the sender was emitting ~43 msg/sec which exceeded
+# the server's effective ingest rate — the queue backed up by ~10 s and
+# the trailing audio got truncated by server-side finalization. PoC used
+# 120 ms chunks and was clean; we land in the same range here.
+_SEND_BATCH_MS = 100
+# After each committed_transcript, wait at MOST this long for ANOTHER one
+# before declaring the session done. The timer resets on every committed
+# event, so a server that emits N segments spread out over the session
+# (Scribe v2 VAD-segments long audio) is fully drained regardless of N.
+# Observed gap between segments on a 96 s clip = sub-second; 2.5 s buys
+# generous headroom.
+_TAIL_IDLE_SEC = 2.5
+# Hard cap so a server that NEVER stops emitting committeds (would be a
+# bug, but defence in depth) can't keep us in the drain loop forever.
+_TAIL_MAX_TOTAL_SEC = 30.0
 # Sentinel that the caller drops into the chunk_queue to mean "end of audio,
 # send commit and finalize". Public so callers can import it.
 END_OF_STREAM = object()
@@ -181,10 +199,18 @@ class RealtimeTranscriber:
         """Run the sender + reader concurrently inside an open WS."""
         committed_text: str = ""
         committed_done = asyncio.Event()
+        # Set on EVERY committed_transcript (not just the first) so the
+        # drain loop can adaptively wait through any number of segments.
+        new_committed = asyncio.Event()
         fatal_err: Optional[RealtimeError] = None
+        # Diagnostics so we can see in voicedrop.log whether truncated tail
+        # was the server segmenting (multiple committed_transcript events)
+        # or our sender lagging behind (low send rate, queue backed up).
+        committed_count = 0
+        partial_count = 0
 
         async def reader():
-            nonlocal committed_text, fatal_err
+            nonlocal committed_text, fatal_err, committed_count, partial_count
             try:
                 async for raw in ws:
                     if isinstance(raw, (bytes, bytearray)):
@@ -199,6 +225,7 @@ class RealtimeTranscriber:
                         continue
                     et = evt.get("type") or evt.get("message_type") or ""
                     if et == "partial_transcript":
+                        partial_count += 1
                         if on_partial is not None:
                             partial = evt.get("text") or ""
                             try:
@@ -211,6 +238,7 @@ class RealtimeTranscriber:
                         "committed_transcript",
                         "committed_transcript_with_timestamps",
                     ):
+                        committed_count += 1
                         txt = evt.get("text") or ""
                         if not txt and "words" in evt:
                             txt = " ".join(
@@ -221,8 +249,19 @@ class RealtimeTranscriber:
                                 txt if not committed_text
                                 else f"{committed_text} {txt}"
                             )
+                        # Per-segment INFO log so we can SEE in voicedrop.log
+                        # how the server segmented this clip — and notice
+                        # immediately if the count drifts vs the final text
+                        # length on a "looks-truncated" complaint.
+                        logging.info(
+                            "Realtime committed segment #%d (len=%d): %s",
+                            committed_count, len(txt), (txt[:80] + "…") if len(txt) > 80 else txt,
+                        )
+                        # Signal both: "first committed arrived" (lets the
+                        # caller release its initial wait) and "we just got
+                        # a fresh committed" (resets the idle-drain timer).
                         committed_done.set()
-                        return  # one committed event closes the session
+                        new_committed.set()
                     elif et == "session_started":
                         # Useful for debugging, but not actionable.
                         logging.debug(
@@ -251,16 +290,50 @@ class RealtimeTranscriber:
                     )
                     committed_done.set()
 
+        # Pre-compute the size threshold for batched sends. PCM16 = 2 bytes
+        # per sample; sample_rate samples per second.
+        batch_threshold_bytes = int(sample_rate * 2 * _SEND_BATCH_MS / 1000)
+        # Diagnostics: how much audio went out vs how many WS messages.
+        # Logged once at session end so we can correlate truncation with
+        # sender rate after the fact.
+        sent_bytes = 0
+        sent_messages = 0
+        send_start_t = time.monotonic()
+
+        async def _flush(buffer: bytearray):
+            nonlocal sent_bytes, sent_messages
+            if not buffer:
+                return
+            n = len(buffer)
+            b64 = base64.b64encode(bytes(buffer)).decode("ascii")
+            await ws.send(json.dumps({
+                "message_type": "input_audio_chunk",
+                "audio_base_64": b64,
+                "sample_rate": sample_rate,
+                "commit": False,
+            }))
+            sent_bytes += n
+            sent_messages += 1
+            buffer.clear()
+
         async def sender():
-            """Drain the chunk_queue, send each as input_audio_chunk."""
+            """Drain ``chunk_queue``, coalescing into ~100 ms WS messages.
+
+            Sending one frame per PortAudio callback (~43/s) overruns the
+            realtime endpoint's ingest pipeline on long clips and the tail
+            audio gets dropped server-side. Buffering to ~100 ms holds the
+            send rate at ~10 msg/s, in line with the published streaming
+            cookbook cadence.
+            """
+            buffer = bytearray()
             try:
                 while True:
                     item = await chunk_queue.get()
                     if item is END_OF_STREAM:
-                        # Send an empty commit message to finalize. Server
-                        # accepts either commit=true with audio_base_64 or
-                        # an audio-less commit; we use the latter so an
-                        # already-drained queue doesn't need a final chunk.
+                        # Drain whatever's still in the buffer first so no
+                        # audio is left behind by the coalescer.
+                        await _flush(buffer)
+                        # Empty commit frame finalizes the session.
                         await ws.send(json.dumps({
                             "message_type": "input_audio_chunk",
                             "audio_base_64": "",
@@ -274,13 +347,9 @@ class RealtimeTranscriber:
                             type(item).__name__,
                         )
                         continue
-                    b64 = base64.b64encode(item).decode("ascii")
-                    await ws.send(json.dumps({
-                        "message_type": "input_audio_chunk",
-                        "audio_base_64": b64,
-                        "sample_rate": sample_rate,
-                        "commit": False,
-                    }))
+                    buffer.extend(item)
+                    if len(buffer) >= batch_threshold_bytes:
+                        await _flush(buffer)
             except ConnectionClosed:
                 # Reader will notice and either pick up an already-arrived
                 # committed_transcript or surface fatal_err.
@@ -291,7 +360,7 @@ class RealtimeTranscriber:
 
         try:
             await sender_task  # blocks until END_OF_STREAM or socket closed
-            # Now wait (with a grace window) for the server's commit reply.
+            # Wait for the FIRST committed_transcript (with grace window).
             try:
                 await asyncio.wait_for(
                     committed_done.wait(), timeout=_COMMIT_GRACE_SEC
@@ -302,6 +371,34 @@ class RealtimeTranscriber:
                         "Timed out waiting for committed_transcript",
                         retryable=True,
                     )
+
+            # Adaptive drain: Scribe v2 segments long audio by internal VAD
+            # into N committed_transcript events. We wait _TAIL_IDLE_SEC
+            # after the LAST committed; the timer resets every time a new
+            # one arrives. So a 4-minute clip emitting 8 segments is just
+            # as well drained as a 30-second clip emitting 1. The reader
+            # also exits naturally on server-side close, ending the loop.
+            drain_start = time.monotonic()
+            while True:
+                if reader_task.done():
+                    break
+                if time.monotonic() - drain_start > _TAIL_MAX_TOTAL_SEC:
+                    logging.warning(
+                        "Realtime drain hit hard cap (%.0fs) — bailing "
+                        "(committed=%d so far)",
+                        _TAIL_MAX_TOTAL_SEC, committed_count,
+                    )
+                    break
+                new_committed.clear()
+                try:
+                    await asyncio.wait_for(
+                        new_committed.wait(), timeout=_TAIL_IDLE_SEC
+                    )
+                    # Got another committed — loop and wait for the next.
+                    continue
+                except asyncio.TimeoutError:
+                    # Idle window elapsed without new committed → done.
+                    break
         finally:
             # Both tasks must end before the `async with ws` block exits to
             # avoid "Task was destroyed but it is pending" warnings.
@@ -313,6 +410,17 @@ class RealtimeTranscriber:
                     await t
                 except (asyncio.CancelledError, Exception):
                     pass
+
+        # Diagnostics: helps tell server-segmented truncation from
+        # sender-lag truncation when the user reports a clipped tail.
+        send_dur = time.monotonic() - send_start_t
+        rate = (sent_bytes / send_dur) if send_dur > 0 else 0.0
+        logging.info(
+            "Realtime session: %d msgs / %d bytes sent in %.1f s "
+            "(%.0f B/s), %d partial, %d committed event(s)",
+            sent_messages, sent_bytes, send_dur, rate,
+            partial_count, committed_count,
+        )
 
         if fatal_err is not None:
             raise fatal_err
