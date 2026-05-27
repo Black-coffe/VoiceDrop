@@ -145,6 +145,10 @@ class VoiceDropApp:
         self.audio_muter = AudioMuter()
         self.elevenlabs_client = ElevenLabsClient()
         self._apply_network_settings()
+        # Warm up the ElevenLabs HTTPS connection in the background so the first
+        # transcribe() of the session doesn't pay TLS handshake + DNS (~100–300 ms).
+        # Daemon thread + best-effort inside warm_up() — never blocks startup.
+        threading.Thread(target=self.elevenlabs_client.warm_up, daemon=True).start()
         self.text_inserter = TextInserter()
         self.db = DatabaseManager()
         self.db.set_retention(load_settings().get('history_retention_hours', HISTORY_RETENTION_HOURS))
@@ -406,7 +410,17 @@ class VoiceDropApp:
             # Optional LLM polish — text mode only (code mode stays verbatim).
             # Best-effort: returns original on error.
             if mode == "text" and self._get_polish_enabled():
-                text = self.text_polisher.polish(text, language=language)
+                # Stream the polish into the overlay as it arrives — UX-only,
+                # the actual paste below still uses the FINAL completed text.
+                def _on_polish_partial(partial: str):
+                    if self.recording_overlay and self._root:
+                        self._root.after(
+                            0,
+                            lambda p=partial: self.recording_overlay.show_polish_partial(p),
+                        )
+                text = self.text_polisher.polish(
+                    text, language=language, on_partial=_on_polish_partial
+                )
             # Custom dictionary: fix tech terms / names STT mangles (local, instant)
             text = self.text_replacer.apply(text)
             # Voice formatting commands: "новая строка", "код блок", ... -> symbols
@@ -419,9 +433,13 @@ class VoiceDropApp:
             word_count = len(text.split())
             char_count = len(text)
             if self.recording_overlay and self._root:
-                self._root.after(0, lambda: self.recording_overlay.show_result(word_count, char_count))
-                # Hide overlay after 1.5 seconds
-                self._root.after(1500, self.recording_overlay.hide)
+                # Hold the final text in overlay for 800 ms so the streaming/typing
+                # effect is readable on short clips (1–2 s polish was flashing by).
+                # Then switch to the "N слов" summary and hide after another 1.5 s.
+                # Doesn't delay paste — text is already inserted above.
+                self._root.after(0, lambda t=text: self.recording_overlay.show_polish_partial(t))
+                self._root.after(800, lambda: self.recording_overlay.show_result(word_count, char_count))
+                self._root.after(800 + 1500, self.recording_overlay.hide)
 
             self._last_text = text  # remember for "Скопировать последнее"
 

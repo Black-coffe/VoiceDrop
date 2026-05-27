@@ -10,9 +10,10 @@ Best-effort: any failure, timeout, or empty result returns the ORIGINAL text
 unchanged — dictation is never lost to polishing. Calls the Anthropic Messages
 API directly over httpx (no SDK dependency, keeps the PyInstaller build lean).
 """
+import json
 import logging
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 
@@ -64,8 +65,17 @@ class TextPolisher:
             self._client = httpx.Client(timeout=_TIMEOUT)
         return self._client
 
-    def polish(self, text: str, language: Optional[str] = None) -> str:
-        """Return cleaned text, or the original on any problem (never raises)."""
+    def polish(self, text: str, language: Optional[str] = None,
+               on_partial: Optional[Callable[[str], None]] = None) -> str:
+        """Return cleaned text, or the original on any problem (never raises).
+
+        If ``on_partial`` is given, polish via Anthropic SSE streaming and call
+        it with the accumulated partial text on each ``content_block_delta``.
+        The callback is best-effort: any exception it raises is logged and
+        swallowed (must NOT break the polish pipeline). The final paste still
+        uses the FULL completed result — partial-text delivery is overlay-only,
+        which keeps push-to-talk paste atomic.
+        """
         if not text or len(text.strip()) < _MIN_CHARS:
             return text
         if not self.api_key:
@@ -103,15 +113,14 @@ class TextPolisher:
 
         try:
             t0 = time.time()
-            resp = self._get_client().post(_API_URL, headers=headers, json=payload)
-            if resp.status_code != 200:
-                logging.warning(f"Polish API {resp.status_code}: {resp.text[:200]}")
-                return text
-            data = resp.json()
-            cleaned = "".join(
-                b.get("text", "") for b in data.get("content", [])
-                if b.get("type") == "text"
-            ).strip()
+            if on_partial is None:
+                cleaned = self._polish_blocking(headers, payload)
+            else:
+                payload["stream"] = True
+                cleaned = self._polish_streaming(headers, payload, on_partial)
+
+            if cleaned is None:
+                return text  # API error already logged by helper
             # In case the model echoes the wrapper tags despite instructions.
             cleaned = (
                 cleaned.replace("<recognized_speech>", "")
@@ -136,6 +145,63 @@ class TextPolisher:
         except Exception as e:
             logging.warning(f"Polish failed ({e}); using original text")
             return text
+
+    def _polish_blocking(self, headers: dict, payload: dict) -> Optional[str]:
+        """Non-streaming path. Returns the cleaned string, or None on API error."""
+        resp = self._get_client().post(_API_URL, headers=headers, json=payload)
+        if resp.status_code != 200:
+            logging.warning(f"Polish API {resp.status_code}: {resp.text[:200]}")
+            return None
+        data = resp.json()
+        return "".join(
+            b.get("text", "") for b in data.get("content", [])
+            if b.get("type") == "text"
+        ).strip()
+
+    def _polish_streaming(self, headers: dict, payload: dict,
+                          on_partial: Callable[[str], None]) -> Optional[str]:
+        """SSE streaming path. Calls on_partial(accumulated_text) on every
+        ``content_block_delta`` text chunk. Returns the full cleaned string, or
+        None on API error. Any exception from on_partial is swallowed.
+        """
+        accumulated: list[str] = []
+        client = self._get_client()
+        with client.stream("POST", _API_URL, headers=headers, json=payload) as resp:
+            if resp.status_code != 200:
+                # Read body for the warning, then bail out.
+                body = resp.read().decode("utf-8", errors="replace")[:200]
+                logging.warning(f"Polish API {resp.status_code}: {body}")
+                return None
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                # httpx yields str when text mode; ensure prefix check works either way.
+                s = line if isinstance(line, str) else line.decode("utf-8", errors="replace")
+                if not s.startswith("data:"):
+                    continue
+                data_str = s[5:].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+                try:
+                    evt = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if evt.get("type") != "content_block_delta":
+                    continue
+                delta = evt.get("delta") or {}
+                if delta.get("type") != "text_delta":
+                    continue
+                chunk = delta.get("text") or ""
+                if not chunk:
+                    continue
+                accumulated.append(chunk)
+                try:
+                    on_partial("".join(accumulated))
+                except Exception as cb_err:
+                    # Overlay update failed (window closed, root gone…). Keep
+                    # streaming — the user still gets the final paste.
+                    logging.debug(f"polish on_partial callback error: {cb_err}")
+        return "".join(accumulated).strip()
 
     def close(self):
         if self._client and not self._client.is_closed:

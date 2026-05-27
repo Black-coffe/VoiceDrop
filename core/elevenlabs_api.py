@@ -100,6 +100,30 @@ class ElevenLabsClient:
             )
         return self._client
 
+    def warm_up(self) -> None:
+        """Establish TCP+TLS to api.elevenlabs.io so the first transcribe()
+        skips the handshake (~100–300 ms saved on cold start).
+
+        Best-effort: any failure is silent. We send a HEAD to the STT endpoint —
+        the server replies 405/4xx but the keepalive connection is now in the
+        httpx pool. No request body, no audio uploaded, doesn't bill.
+        """
+        if not self.api_key:
+            return
+        try:
+            client = self._get_client()
+            # Short timeout: if warm-up can't finish in 5s, we don't want it
+            # piling up behind a real transcribe call later.
+            client.head(
+                ELEVENLABS_STT_URL,
+                headers={"xi-api-key": self.api_key},
+                timeout=httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0),
+            )
+            logging.debug("ElevenLabs connection warmed up")
+        except Exception as e:
+            # Cold start will just pay the handshake. Not worth surfacing.
+            logging.debug(f"ElevenLabs warm-up skipped: {e}")
+
     def transcribe(self, audio_data: bytes, language: str = None) -> str:
         """
         Transcribe audio to text using ElevenLabs API, with retries/backoff.

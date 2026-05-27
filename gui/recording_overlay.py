@@ -230,6 +230,24 @@ class RecordingOverlay:
         if self._status_label:
             self._status_label.config(text="Обработка...")
 
+    def show_polish_partial(self, partial_text: str):
+        """Show the tail of the polished text as it streams in.
+
+        Visual-only — the actual paste still happens once on the FINAL text
+        in _process_audio, so this can never affect what gets inserted into
+        the user's window. Safe to call on a destroyed overlay (no-op).
+        """
+        if self._status_label is None:
+            return
+        tail = (partial_text or "").strip().replace("\n", " ")
+        if len(tail) > 38:
+            tail = "…" + tail[-37:]
+        try:
+            self._status_label.config(text=tail or "Обработка...", fg='#888888')
+        except Exception:
+            # Tk widget can be torn down between threads; ignore.
+            pass
+
     def show_result(self, word_count: int, char_count: int):
         """Show result after transcription"""
         if self._status_label:
