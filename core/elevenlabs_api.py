@@ -16,9 +16,10 @@ import httpx
 
 from config import ELEVENLABS_API_KEY, ELEVENLABS_STT_URL
 
-# scribe_v1 tags non-speech sounds as parentheticals like "(смеётся)", "(тишина)".
-# We disable them at source via tag_audio_events=false; this strips any residue
-# (only parentheses that contain a known audio-event word, so real text is safe).
+# Scribe (v1 and v2) tags non-speech sounds as parentheticals like "(смеётся)",
+# "(тишина)". We disable them at source via tag_audio_events=false; this strips
+# any residue (only parentheses that contain a known audio-event word, so real
+# text is safe).
 _AUDIO_EVENT_RE = re.compile(
     r"\s*\([^)]*?(?:смеёт|смеет|смех|хохот|кашл|вздыха|вздох|тишина|молчан|музык|"
     r"аплодисм|шум|шёпот|шепот|laugh|cough|sigh|silence|music|applause|noise|"
@@ -144,9 +145,12 @@ class ElevenLabsClient:
 
         client = self._get_client()
         headers = {"xi-api-key": self.api_key}
-        # tag_audio_events=false: don't emit "(laughs)"/"(тишина)" non-speech tags.
-        data = {"model_id": "scribe_v1", "tag_audio_events": "false"}
-        # Only pin the language if specified (otherwise scribe_v1 auto-detects).
+        # scribe_v2: scribe_v1 is removed by ElevenLabs on 2026-07-09. v2 is
+        # API-compatible (same multipart form), better WER (2.3%), RU/UK both
+        # tier "Excellent". tag_audio_events still defaults to true in v2, so we
+        # keep sending false to suppress "(laughs)"/"(тишина)" non-speech tags.
+        data = {"model_id": "scribe_v2", "tag_audio_events": "false"}
+        # Only pin the language if specified (otherwise scribe_v2 auto-detects).
         if language:
             data["language_code"] = language
 

@@ -1,7 +1,7 @@
 """
 Voice Commands - turn spoken formatting commands into real characters.
 
-scribe_v1 already adds punctuation, so the defaults focus on STRUCTURE that STT
+Scribe (v2) already adds punctuation, so the defaults focus on STRUCTURE that STT
 cannot produce: new line / paragraph / code block / list item / tab. Phrases are
 matched as whole words (RU/UK, case-insensitive); after substitution the spacing
 around inserted newlines is tidied. Editable via commands.json next to the exe
@@ -46,7 +46,7 @@ class VoiceCommands:
             "_comment": ("Голосовые команды форматирования: say -> insert "
                          "(\\n = новая строка, \\t = табуляция). Произносите команды "
                          "в базовой форме. Пунктуация (точка/запятая) НЕ включена: "
-                         "распознавание scribe_v1 расставляет её само. Добавляйте свои."),
+                         "распознавание Scribe расставляет её само. Добавляйте свои."),
             "commands": DEFAULT_COMMANDS,
         }
         try:
