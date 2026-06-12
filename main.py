@@ -596,6 +596,7 @@ class VoiceDropApp:
 
     def _process_audio(self, audio_data: bytes, duration_ms: int, forced_mode: Optional[str] = None):
         """Process audio: transcribe and insert text"""
+        proc_t0 = time.monotonic()  # C5: release→inserted pipeline clock
         # Keep this clip so it can be re-transcribed in another language later.
         self._last_audio_data = audio_data
         self._last_duration_ms = duration_ms
@@ -627,7 +628,7 @@ class VoiceDropApp:
 
             text = text.strip()
             self._finish_text(text, audio_data, duration_ms, forced_mode, language,
-                              stt_mode="batch")
+                              stt_mode="batch", stt_sec=elapsed, proc_t0=proc_t0)
 
         except TranscriptionError as e:
             # Transcription failed after retries. Queue it for auto-resend if the
@@ -675,7 +676,8 @@ class VoiceDropApp:
 
     def _finish_text(self, text: str, audio_data: bytes, duration_ms: int,
                      forced_mode: Optional[str], language: Optional[str],
-                     stt_mode: str = "batch"):
+                     stt_mode: str = "batch", stt_sec: float = 0.0,
+                     proc_t0: Optional[float] = None):
         """Post-STT pipeline shared by batch and realtime paths.
 
         Takes a non-empty, stripped transcript and runs: polish → dictionary
@@ -690,6 +692,7 @@ class VoiceDropApp:
 
         # Optional LLM polish — text mode only (code mode stays verbatim).
         # Best-effort: returns original on error.
+        polish_sec = 0.0
         if mode == "text" and self._get_polish_enabled():
             # Stream the polish into the overlay as it arrives — UX-only,
             # the actual paste below still uses the FINAL completed text.
@@ -699,10 +702,12 @@ class VoiceDropApp:
                         0,
                         lambda p=partial: self.recording_overlay.show_polish_partial(p),
                     )
+            _polish_t0 = time.monotonic()
             text = self.text_polisher.polish(
                 text, language=language, on_partial=_on_polish_partial,
                 min_words=self._get_polish_min_words(),  # C2: skip on short clips
             )
+            polish_sec = time.monotonic() - _polish_t0
         # Custom dictionary: fix tech terms / names STT mangles (local, instant)
         text = self.text_replacer.apply(text)
         # Voice formatting commands: "новая строка", "код блок", ... -> symbols
@@ -727,6 +732,7 @@ class VoiceDropApp:
 
         # Deliver text per the chosen insert mode
         insert_mode = self._get_insert_mode()
+        _insert_t0 = time.monotonic()
         if insert_mode == "clipboard":
             self.text_inserter.copy_to_clipboard(text)
             inserted = False
@@ -734,6 +740,7 @@ class VoiceDropApp:
             inserted = self.text_inserter.insert_text(text, press_enter=True)
         else:  # "window"
             inserted = self.text_inserter.insert_text(text)
+        insert_sec = time.monotonic() - _insert_t0
 
         # Save to database (unless history saving is disabled for privacy)
         if self._get_save_history():
@@ -742,6 +749,16 @@ class VoiceDropApp:
 
         # Play success sound
         winsound.Beep(800, 100)  # Short high-pitched beep
+
+        # C5: one line per clip for the whole release→inserted pipeline, so the
+        # effect of every latency change (C1/C2/C3…) is visible at a glance.
+        total_sec = (time.monotonic() - proc_t0) if proc_t0 is not None else 0.0
+        logging.info(
+            "Pipeline [%s]: capture %.1fs | stt %.2fs | polish %.2fs | "
+            "insert %.2fs | total %.2fs (%d words)",
+            stt_mode, duration_ms / 1000.0, stt_sec, polish_sec,
+            insert_sec, total_sec, word_count,
+        )
 
         logging.info(f"Done! Text: {text}")
 
@@ -757,6 +774,7 @@ class VoiceDropApp:
         retry via batch — exact same fallback as ``TranscriptionError``. No
         audio is ever lost.
         """
+        proc_t0 = time.monotonic()  # C5: release→inserted pipeline clock
         self._last_audio_data = audio_data
         self._last_duration_ms = duration_ms
         with self._lock:
@@ -828,8 +846,12 @@ class VoiceDropApp:
                     self._root.after(0, self.recording_overlay.hide)
                 return
             logging.info(f"Realtime transcript ({duration_ms} ms): {text[:80]}...")
+            # For realtime, "stt" latency is the post-release drain (streaming
+            # happened during recording) — approximated by the pipeline clock
+            # up to this point.
             self._finish_text(text, audio_data, duration_ms, forced_mode, language,
-                              stt_mode="realtime")
+                              stt_mode="realtime", stt_sec=time.monotonic() - proc_t0,
+                              proc_t0=proc_t0)
 
         except Exception as e:
             logging.error(f"Error processing realtime audio: {e}", exc_info=True)
