@@ -159,7 +159,7 @@ class RealtimeTranscriber:
         keyterms: Optional[list] = None,
         commit_strategy: str = "manual",
         vad_silence_threshold_secs: Optional[float] = None,
-        include_timestamps: bool = True,
+        include_timestamps: bool = False,
     ) -> str:
         """Open WS, drain ``chunk_queue``, return the final committed text.
 
@@ -189,8 +189,12 @@ class RealtimeTranscriber:
             term = str(kt).strip()[:_RT_KEYTERM_MAXLEN].strip()
             if term:
                 params.append(("keyterms", term))
-        # C1: ask for word timestamps so the drain loop can finish as soon as
-        # the committed transcript covers the audio (instead of waiting 2.5 s).
+        # C1 (OPT-IN, default off): ask for word timestamps so the drain loop can
+        # finish as soon as the committed transcript covers the audio. Disabled by
+        # default after a live test showed requesting timestamps made the server
+        # double-emit committed events and drop the BEGINNING of long clips —
+        # see memory c1-timestamps-truncation. The proven path = single committed
+        # events + the 2.5 s idle drain.
         if include_timestamps:
             params.append(("include_timestamps", "true"))
         # B3: opt-in server-side VAD commit (recommended for mic input — the

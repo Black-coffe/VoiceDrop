@@ -324,6 +324,9 @@ class VoiceDropApp:
             vad_thresh = float(vad_thresh) if vad_thresh is not None else None
         except (TypeError, ValueError):
             vad_thresh = None
+        # C1: opt-in (default OFF). Requesting timestamps lost the beginning of
+        # long clips in a live test — see memory c1-timestamps-truncation.
+        include_ts = bool(s.get('rt_include_timestamps', False))
 
         return await self.realtime_transcriber.transcribe_stream(
             chunk_queue=chunk_queue,
@@ -334,6 +337,7 @@ class VoiceDropApp:
             keyterms=self._get_keyterms(realtime=True),  # B2
             commit_strategy=commit_strategy,            # B3
             vad_silence_threshold_secs=vad_thresh,       # B3
+            include_timestamps=include_ts,               # C1 (opt-in)
         )
 
     def _rt_enqueue_chunk(self, chunk: bytes):

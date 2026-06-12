@@ -326,14 +326,16 @@ class RealtimeQueryParamTests(unittest.TestCase):
         run(scenario())
         return captured["url"]
 
-    def test_defaults_only_include_timestamps(self):
-        # C1 turns include_timestamps on by default; nothing else is requested.
+    def test_defaults_are_plain(self):
+        # C1 is opt-in now (default off after the long-clip truncation), so by
+        # default the URL carries nothing.
         url = self._capture_url()
-        self.assertIn("include_timestamps=true", url)
-        self.assertNotIn("language_code=", url)
-        self.assertNotIn("no_verbatim=", url)
-        self.assertNotIn("keyterms=", url)
-        self.assertNotIn("commit_strategy=", url)
+        self.assertNotIn("?", url)
+
+    def test_include_timestamps_opt_in(self):
+        self.assertNotIn("include_timestamps", self._capture_url())
+        self.assertIn("include_timestamps=true",
+                      self._capture_url(include_timestamps=True))
 
     def test_no_verbatim_in_query(self):
         url = self._capture_url(no_verbatim=True)
@@ -402,7 +404,9 @@ class RealtimeC1CoverageTests(unittest.TestCase):
                 # If C1 fails to break early, the hanging socket + large idle
                 # would stall until overall_timeout → a clear test failure.
                 return await asyncio.wait_for(
-                    self.rt.transcribe_stream(q, sample_rate=16000),
+                    # C1 is opt-in; request timestamps to exercise its drain.
+                    self.rt.transcribe_stream(
+                        q, sample_rate=16000, include_timestamps=True),
                     timeout=overall_timeout,
                 )
 
