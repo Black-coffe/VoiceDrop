@@ -305,11 +305,13 @@ class VoiceDropApp:
         """Bridge: forward partial_transcript to the overlay (via Tk-safe
         ``after(0, …)``) and run the transcriber's WS session."""
         def on_partial(text: str):
+            # G1: live subtitles — show what's being recognized DURING recording
+            # (the overlay debounces these to ~1 repaint / 150 ms).
             if self.recording_overlay and self._root:
                 try:
                     self._root.after(
                         0,
-                        lambda t=text: self.recording_overlay.show_polish_partial(t),
+                        lambda t=text: self.recording_overlay.show_subtitle(t),
                     )
                 except Exception:
                     pass
