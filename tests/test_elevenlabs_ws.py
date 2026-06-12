@@ -223,6 +223,60 @@ class RealtimeTranscriberTests(unittest.TestCase):
         # reset by the time the retry fires.
         self.assertTrue(ctx.exception.retryable)
 
+    def test_commit_throttled_with_committed_returns_text(self):
+        """commit_throttled AFTER segments were committed (long clip whose VAD
+        already finalized everything → 0.00s uncommitted) is NOT fatal: the
+        transcript exists, so we return it as success instead of throwing it
+        away and paying for a second batch transcription of the same audio.
+        """
+        events = [
+            {"message_type": "session_started"},
+            {"message_type": "committed_transcript",
+             "text": "Длинная диктовка целиком."},
+            {"message_type": "commit_throttled",
+             "detail": "only 0.00s of uncommitted audio"},
+        ]
+        ws = FakeWebSocket(events)
+
+        async def scenario():
+            q = asyncio.Queue()
+            await q.put(b"\x00" * 64)
+            await q.put(END_OF_STREAM)
+            with patch("core.elevenlabs_ws._TAIL_IDLE_SEC", 0.05), \
+                 patch("core.elevenlabs_ws.websockets.connect",
+                       lambda *a, **kw: fake_connect_factory(ws)()):
+                return await self.rt.transcribe_stream(q, sample_rate=16000)
+
+        result = run(scenario())
+        self.assertEqual(result, "Длинная диктовка целиком.")
+
+    def test_commit_throttled_without_committed_raises_throttled_empty(self):
+        """commit_throttled with NOTHING committed = a clip with no speech.
+        Must raise RealtimeError(throttled_empty=True) so the caller discards a
+        sub-0.3s clip instead of poison-queueing a guaranteed-to-fail WAV for
+        batch retry (the audio_too_short pending loop, roadmap A2/A3).
+        """
+        events = [
+            {"message_type": "session_started"},
+            {"message_type": "commit_throttled",
+             "detail": "only 0.00s of uncommitted audio"},
+        ]
+        ws = FakeWebSocket(events)
+
+        async def scenario():
+            q = asyncio.Queue()
+            await q.put(END_OF_STREAM)
+            with patch("core.elevenlabs_ws.websockets.connect",
+                       lambda *a, **kw: fake_connect_factory(ws)()):
+                await self.rt.transcribe_stream(q, sample_rate=16000)
+
+        with self.assertRaises(RealtimeError) as ctx:
+            run(scenario())
+        self.assertTrue(ctx.exception.throttled_empty)
+        # retryable=True but the caller short-circuits on throttled_empty for
+        # tiny clips; for a non-tiny clip it would still fall back to batch.
+        self.assertTrue(ctx.exception.retryable)
+
     def test_closed_before_commit_raises_retryable(self):
         from websockets.exceptions import ConnectionClosedError
         events = [

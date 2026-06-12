@@ -66,12 +66,18 @@ END_OF_STREAM = object()
 
 # Inbound event types that are fatal — abandon WS, raise RealtimeError so the
 # caller can fall back to batch + pending queue.
+# NOTE: commit_throttled is deliberately NOT here — it is handled specially
+# (see reader()). The server emits it when we send commit:true but there is too
+# little *uncommitted* audio to commit. On a long clip the VAD has usually
+# already committed everything (uncommitted ~0.00s) so the transcript EXISTS and
+# we must return it as success instead of throwing it away and paying for a
+# second batch run. On a sub-0.3s clip nothing was committed and there is simply
+# no speech — that must be discarded, not poison-queued for batch retry.
 _FATAL_EVENTS = frozenset({
     "error",
     "auth_error",
     "quota_exceeded",
     "rate_limited",
-    "commit_throttled",
     "queue_overflow",
     "resource_exhausted",
     "session_time_limit_exceeded",
@@ -90,10 +96,16 @@ class RealtimeError(Exception):
     the caller MAY queue the accumulated WAV for batch retry.
     """
 
-    def __init__(self, message: str, offline: bool = False, retryable: bool = True):
+    def __init__(self, message: str, offline: bool = False, retryable: bool = True,
+                 throttled_empty: bool = False):
         super().__init__(message)
         self.offline = offline
         self.retryable = retryable
+        # True for commit_throttled where the server had nothing committed and
+        # nothing left to commit — i.e. the clip carried no transcribable speech.
+        # The caller discards a sub-0.3s clip on this flag instead of queueing a
+        # guaranteed-to-fail WAV for batch retry (the pending poison-loop source).
+        self.throttled_empty = throttled_empty
 
 
 class RealtimeTranscriber:
@@ -268,6 +280,23 @@ class RealtimeTranscriber:
                             "Realtime session_started: %s",
                             evt.get("session_id", "?"),
                         )
+                    elif et == "commit_throttled":
+                        # Server rejected our commit:true because too little
+                        # *uncommitted* audio remained. NOT fatal:
+                        #  - if segments were already committed (VAD finalized
+                        #    the whole clip), the transcript exists — finalize
+                        #    and return it as success (don't pay for batch again);
+                        #  - if nothing was committed, the clip had no speech —
+                        #    flag throttled_empty so the caller discards a tiny
+                        #    clip instead of poison-queueing it for batch.
+                        logging.info("Realtime commit_throttled: %s", evt)
+                        if committed_count == 0:
+                            fatal_err = RealtimeError(
+                                f"commit_throttled with no committed audio: {evt}",
+                                retryable=True, throttled_empty=True,
+                            )
+                        committed_done.set()
+                        return
                     elif et in _FATAL_EVENTS:
                         non_retry = et in ("auth_error", "input_error")
                         fatal_err = RealtimeError(

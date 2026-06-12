@@ -722,6 +722,19 @@ class VoiceDropApp:
                 )
                 return
             except RealtimeError as e:
+                # commit_throttled with nothing committed on a sub-0.3s clip =
+                # no speech. Discard it (short beep, NO pending) — queueing it
+                # for batch is exactly what created the audio_too_short poison
+                # loop in the pending queue.
+                if getattr(e, "throttled_empty", False) and duration_ms < 300:
+                    logging.info(
+                        "Realtime commit_throttled on %d ms clip — discarding "
+                        "as too short (no pending)", duration_ms
+                    )
+                    winsound.Beep(400, 120)  # brief "too short" beep
+                    if self.recording_overlay and self._root:
+                        self._root.after(0, self.recording_overlay.hide)
+                    return
                 logging.warning(f"Realtime failed ({e}); falling back to pending+batch")
                 if e.retryable:
                     self._queue_for_batch_retry(
@@ -795,10 +808,14 @@ class VoiceDropApp:
         Runs on the background scheduler. On success the text goes to history (NOT
         auto-pasted — the cursor has long moved on) plus a tray notification.
         """
+        # Expire stale items first (TTL) — these are dead-lettered, not retried.
+        dead_lettered = list(self.pending_queue.sweep_ttl())
+
         items = self.pending_queue.list_pending()
-        if not items:
+        if not items and not dead_lettered:
             return
-        logging.info(f"Pending queue: {len(items)} item(s), attempting resend...")
+        if items:
+            logging.info(f"Pending queue: {len(items)} item(s), attempting resend...")
         for item in items:
             try:
                 audio = self.pending_queue.read_audio(item)
@@ -813,7 +830,16 @@ class VoiceDropApp:
                 if e.offline:
                     logging.info("Pending resend: still offline, will retry later")
                     break  # no point trying the rest of the queue while offline
-                logging.info(f"Pending resend still failing (will retry later): {e}")
+                if not e.retryable:
+                    # Permanent error (400 audio_too_short / validation, 401/403
+                    # auth): re-sending will NEVER succeed. Move to dead-letter so
+                    # it stops burning a request every 45 s (the poison-loop bug).
+                    if self.pending_queue.dead_letter(item, reason=str(e)):
+                        dead_lettered.append(item)
+                    continue
+                # Transient (5xx / 429 / transport): keep it, retry next tick.
+                # DEBUG (not INFO) so a lingering outage doesn't spam the log.
+                logging.debug(f"Pending resend still failing (will retry later): {e}")
                 continue
             except Exception as e:
                 logging.error(f"Pending resend unexpected error: {e}", exc_info=True)
@@ -833,6 +859,16 @@ class VoiceDropApp:
             else:
                 logging.info(f"Pending item {item.get('id')} transcribed empty; discarding")
             self.pending_queue.remove(item)
+
+        # One tray notification covering everything that left the queue as a
+        # permanent failure this tick (TTL sweep + non-retryable resends).
+        if dead_lettered and self.tray_icon:
+            n = len(dead_lettered)
+            self.tray_icon.show_notification(
+                "VoiceDrop — записи не удалось расшифровать",
+                f"Отброшено из очереди (постоянная ошибка): {n}. "
+                f"Файлы сохранены в pending/dead/."
+            )
 
     def _apply_saved_settings(self):
         """Apply saved settings on startup"""
