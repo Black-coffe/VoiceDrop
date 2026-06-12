@@ -326,9 +326,14 @@ class RealtimeQueryParamTests(unittest.TestCase):
         run(scenario())
         return captured["url"]
 
-    def test_no_params_plain_url(self):
+    def test_defaults_only_include_timestamps(self):
+        # C1 turns include_timestamps on by default; nothing else is requested.
         url = self._capture_url()
-        self.assertNotIn("?", url)
+        self.assertIn("include_timestamps=true", url)
+        self.assertNotIn("language_code=", url)
+        self.assertNotIn("no_verbatim=", url)
+        self.assertNotIn("keyterms=", url)
+        self.assertNotIn("commit_strategy=", url)
 
     def test_no_verbatim_in_query(self):
         url = self._capture_url(no_verbatim=True)
@@ -344,6 +349,89 @@ class RealtimeQueryParamTests(unittest.TestCase):
         self.assertIn("keyterms=VoiceDrop", url)
         # The over-long term is truncated to 20 chars in the URL.
         self.assertIn("keyterms=" + "x" * 20 + "&", url + "&")
+
+    def test_commit_strategy_manual_by_default(self):
+        url = self._capture_url()
+        self.assertNotIn("commit_strategy=", url)
+
+    def test_commit_strategy_vad_with_threshold(self):  # B3
+        url = self._capture_url(commit_strategy="vad",
+                                vad_silence_threshold_secs=0.8)
+        self.assertIn("commit_strategy=vad", url)
+        self.assertIn("vad_silence_threshold_secs=0.8", url)
+
+
+class _HangingWS:
+    """Like FakeWebSocket but stays 'open' (awaits forever) after the scripted
+    events, so the drain loop must end on its own logic (C1 coverage / idle)
+    rather than the reader iterator simply running out."""
+
+    def __init__(self, events):
+        self._events = list(events)
+        self.sent = []
+
+    async def send(self, payload):
+        self.sent.append(payload)
+
+    def __aiter__(self):
+        return self._iter()
+
+    async def _iter(self):
+        for ev in self._events:
+            await asyncio.sleep(0)
+            yield json.dumps(ev)
+        await asyncio.sleep(3600)  # server hasn't closed; reader stays alive
+
+
+class RealtimeC1CoverageTests(unittest.TestCase):
+    """C1: finish the drain as soon as committed timestamps cover the audio."""
+
+    def setUp(self):
+        self.rt = RealtimeTranscriber(api_key="test-key")
+
+    def _run(self, events, audio_bytes, idle_sec, overall_timeout):
+        ws = _HangingWS(events)
+
+        async def scenario():
+            q = asyncio.Queue()
+            await q.put(audio_bytes)
+            await q.put(END_OF_STREAM)
+            with patch("core.elevenlabs_ws._TAIL_IDLE_SEC", idle_sec), \
+                 patch("core.elevenlabs_ws.websockets.connect",
+                       lambda *a, **kw: fake_connect_factory(ws)()):
+                # If C1 fails to break early, the hanging socket + large idle
+                # would stall until overall_timeout → a clear test failure.
+                return await asyncio.wait_for(
+                    self.rt.transcribe_stream(q, sample_rate=16000),
+                    timeout=overall_timeout,
+                )
+
+        return run(scenario())
+
+    def test_finishes_early_when_timestamps_cover_audio(self):
+        # 1 s of PCM16 @16k = 32000 bytes; committed words end at 1.0 s.
+        audio = b"\x00" * 32000
+        events = [
+            {"message_type": "session_started"},
+            {"message_type": "committed_transcript_with_timestamps",
+             "words": [{"text": "привет", "start": 0.0, "end": 0.5},
+                       {"text": "мир", "start": 0.5, "end": 1.0}]},
+        ]
+        # idle is huge: if coverage didn't break, wait_for would time out.
+        result = self._run(events, audio, idle_sec=30.0, overall_timeout=5.0)
+        self.assertEqual(result, "привет мир")
+
+    def test_falls_back_to_idle_when_not_covered(self):
+        # 2 s of audio but words only reach 0.4 s → no coverage; the idle-drain
+        # fallback (small here) must still finish and return what we have.
+        audio = b"\x00" * 64000  # 2 s
+        events = [
+            {"message_type": "session_started"},
+            {"message_type": "committed_transcript_with_timestamps",
+             "words": [{"text": "край", "start": 0.0, "end": 0.4}]},
+        ]
+        result = self._run(events, audio, idle_sec=0.1, overall_timeout=5.0)
+        self.assertEqual(result, "край")
 
 
 if __name__ == "__main__":

@@ -314,6 +314,15 @@ class VoiceDropApp:
                 except Exception:
                     pass
 
+        # B3: opt-in server-side VAD commit + its silence threshold (advanced).
+        s = load_settings()
+        commit_strategy = (s.get('rt_commit_strategy') or 'manual').strip().lower()
+        vad_thresh = s.get('rt_vad_silence_threshold_secs')
+        try:
+            vad_thresh = float(vad_thresh) if vad_thresh is not None else None
+        except (TypeError, ValueError):
+            vad_thresh = None
+
         return await self.realtime_transcriber.transcribe_stream(
             chunk_queue=chunk_queue,
             sample_rate=16000,
@@ -321,6 +330,8 @@ class VoiceDropApp:
             language=language,
             no_verbatim=self._get_no_verbatim(),       # B1
             keyterms=self._get_keyterms(realtime=True),  # B2
+            commit_strategy=commit_strategy,            # B3
+            vad_silence_threshold_secs=vad_thresh,       # B3
         )
 
     def _rt_enqueue_chunk(self, chunk: bytes):

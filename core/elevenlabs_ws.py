@@ -66,6 +66,12 @@ _TAIL_IDLE_SEC = 2.5
 # Hard cap so a server that NEVER stops emitting committeds (would be a
 # bug, but defence in depth) can't keep us in the drain loop forever.
 _TAIL_MAX_TOTAL_SEC = 30.0
+# C1: once committed word timestamps cover the sent audio to within this slack,
+# finish immediately instead of waiting out _TAIL_IDLE_SEC — saves ~1.5-2 s per
+# clip. Kept SMALL so we never finish before a real trailing word commits
+# (segments commit atomically with all their words, so the only risk is a tiny
+# slack window; 300 ms covers push-to-talk release reaction without truncating).
+_TAIL_COVERAGE_SLACK_MS = 300
 # Sentinel that the caller drops into the chunk_queue to mean "end of audio,
 # send commit and finalize". Public so callers can import it.
 END_OF_STREAM = object()
@@ -92,6 +98,23 @@ _FATAL_EVENTS = frozenset({
     "insufficient_audio_activity",
     "transcriber_error",
 })
+
+
+def _max_word_end_ms(evt: dict) -> int:
+    """Largest word END timestamp (ms) in a committed event, or 0 if none.
+
+    ElevenLabs word timestamps are floats in SECONDS. Tolerant of a few key
+    spellings; ignores anything non-numeric so a schema tweak can't crash us."""
+    best = 0
+    for w in (evt.get("words") or []):
+        if not isinstance(w, dict):
+            continue
+        for k in ("end", "end_time", "end_sec", "endTime", "end_s"):
+            v = w.get(k)
+            if isinstance(v, (int, float)):
+                best = max(best, int(float(v) * 1000))
+                break
+    return best
 
 
 class RealtimeError(Exception):
@@ -134,6 +157,9 @@ class RealtimeTranscriber:
         language: Optional[str] = None,
         no_verbatim: bool = False,
         keyterms: Optional[list] = None,
+        commit_strategy: str = "manual",
+        vad_silence_threshold_secs: Optional[float] = None,
+        include_timestamps: bool = True,
     ) -> str:
         """Open WS, drain ``chunk_queue``, return the final committed text.
 
@@ -163,6 +189,19 @@ class RealtimeTranscriber:
             term = str(kt).strip()[:_RT_KEYTERM_MAXLEN].strip()
             if term:
                 params.append(("keyterms", term))
+        # C1: ask for word timestamps so the drain loop can finish as soon as
+        # the committed transcript covers the audio (instead of waiting 2.5 s).
+        if include_timestamps:
+            params.append(("include_timestamps", "true"))
+        # B3: opt-in server-side VAD commit (recommended for mic input — the
+        # server segments on silence, removing the commit_throttled class). Off
+        # by default; the manual final commit:true still flushes the tail.
+        if str(commit_strategy).lower() == "vad":
+            params.append(("commit_strategy", "vad"))
+            if vad_silence_threshold_secs is not None:
+                params.append(
+                    ("vad_silence_threshold_secs", str(vad_silence_threshold_secs))
+                )
         url = f"{WS_URL}?{urlencode(params)}" if params else WS_URL
 
         try:
@@ -238,9 +277,13 @@ class RealtimeTranscriber:
         # or our sender lagging behind (low send rate, queue backed up).
         committed_count = 0
         partial_count = 0
+        # C1: max END timestamp (ms) across all committed words so far. The
+        # drain loop finishes early once this covers the sent audio.
+        committed_end_ms = 0
 
         async def reader():
             nonlocal committed_text, fatal_err, committed_count, partial_count
+            nonlocal committed_end_ms
             try:
                 async for raw in ws:
                     if isinstance(raw, (bytes, bytearray)):
@@ -279,6 +322,8 @@ class RealtimeTranscriber:
                                 txt if not committed_text
                                 else f"{committed_text} {txt}"
                             )
+                        # C1: track how far the committed transcript reaches.
+                        committed_end_ms = max(committed_end_ms, _max_word_end_ms(evt))
                         # Per-segment INFO log so we can SEE in voicedrop.log
                         # how the server segmented this clip — and notice
                         # immediately if the count drifts vs the final text
@@ -425,9 +470,27 @@ class RealtimeTranscriber:
             # one arrives. So a 4-minute clip emitting 8 segments is just
             # as well drained as a 30-second clip emitting 1. The reader
             # also exits naturally on server-side close, ending the loop.
+            # C1: total audio we actually sent (PCM16 = 2 bytes/sample). Final
+            # once the sender has drained, which it has (awaited above).
+            sent_audio_ms = (
+                int(sent_bytes / (sample_rate * 2) * 1000) if sample_rate else 0
+            )
             drain_start = time.monotonic()
             while True:
                 if reader_task.done():
+                    break
+                # C1: committed timestamps cover (almost) all sent audio →
+                # the transcript is complete, finish now instead of idling.
+                # The `<= 2×` guard rejects a seconds/ms misparse so we can't
+                # finish early on a bogusly-large timestamp.
+                if (sent_audio_ms > 0 and committed_end_ms > 0
+                        and committed_end_ms <= sent_audio_ms * 2
+                        and committed_end_ms >= sent_audio_ms - _TAIL_COVERAGE_SLACK_MS):
+                    logging.info(
+                        "Realtime drain: timestamps cover audio "
+                        "(%d/%d ms) — finishing early (C1)",
+                        committed_end_ms, sent_audio_ms,
+                    )
                     break
                 if time.monotonic() - drain_start > _TAIL_MAX_TOTAL_SEC:
                     logging.warning(
