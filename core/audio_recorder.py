@@ -22,14 +22,24 @@ _HOSTAPI_PRIORITY = {
     'Windows WDM-KS': 3,
 }
 
-# Open at most twice: first try uses the cached device list; if it fails, wait
-# a short settle delay and retry the SAME device once. We deliberately do NOT
-# call sd._terminate()/sd._initialize() between attempts — issue #516 / #47:
-# refreshing PortAudio's cache mid-process is documented to lose devices and
-# can crash the interpreter. Production log confirms it: FOX disappeared after
-# the refresh and never came back without an app restart.
-_OPEN_MAX_ATTEMPTS = 2
-_OPEN_RETRY_SETTLE_SEC = 0.18
+# Open with several attempts. The mic can fail to open right after a USB
+# selective-suspend wake in TWO ways, both seen in the field on the FOX:
+#   1. sd.InputStream raises PaErrorCode -9999 "device ID out of range";
+#   2. the device isn't in sd.query_devices() YET (mid-enumeration) so
+#      resolve-by-name comes back empty → "микрофон не найден".
+# The old 2×180 ms didn't cover the wake window (~1-2 s typical, up to ~20 s
+# worst case). We now retry up to 5 times with a 0.2/0.4/0.8/1.2 s backoff
+# (~2.6 s total) and RE-RESOLVE the device BY NAME before every attempt (the
+# index may have shifted on re-enumeration). The user is holding the hotkey
+# and still talking, so a couple seconds to land the stream is acceptable.
+#
+# We deliberately do NOT call sd._terminate()/sd._initialize() between attempts
+# — issue #516 / #47: refreshing PortAudio's cache mid-process is documented to
+# lose devices and can crash the interpreter. Production log confirms it: FOX
+# disappeared after the refresh and never came back without an app restart.
+_OPEN_MAX_ATTEMPTS = 5
+# Backoff before attempts 2..5 (index = attempt-1). Sums to ~2.6 s.
+_OPEN_RETRY_BACKOFF_SEC = (0.2, 0.4, 0.8, 1.2)
 
 # Target rate for the realtime WS chunk callback. Scribe v2 Realtime is happy
 # with 16/24/44.1/48 kHz, but 16 kHz minimizes the JSON+base64 payload on the
@@ -153,29 +163,52 @@ class AudioRecorder:
             logging.warning(f"Could not query device samplerate, using fallback {SAMPLE_RATE}: {e}")
         return SAMPLE_RATE
 
-    def start_recording(self):
+    def start_recording(self, on_retry: Optional[Callable[[int, int], None]] = None):
         """Start recording audio from the configured mic (resolved BY NAME).
 
         Raises RuntimeError if a specific microphone was configured but is not
-        currently present — we never silently fall back to the system default.
+        present after all retry attempts — we never silently fall back to the
+        system default.
 
-        Open path: query the device's native samplerate and open at that rate.
-        On failure, wait briefly and retry the SAME device once. We do NOT
-        rebuild PortAudio's device cache here — see _OPEN_MAX_ATTEMPTS note.
+        Open path: resolve the device BY NAME, query its native samplerate and
+        open at that rate. On a transient failure (-9999 open error OR the
+        device not in the list yet, both common after a USB-suspend wake) we
+        wait with backoff, re-resolve, and try again up to _OPEN_MAX_ATTEMPTS.
+        ``on_retry(attempt, total)`` (if given) is called before each wait so
+        the UI can show "Подключаю микрофон…". We do NOT rebuild PortAudio's
+        device cache here — see _OPEN_MAX_ATTEMPTS note.
         """
         last_err: Optional[Exception] = None
         for attempt in range(_OPEN_MAX_ATTEMPTS):
             if attempt > 0:
-                # Brief settle so the device/driver has a moment to recover
-                # (USB wakeup, MME WaveIn driver re-arm). No cache refresh.
-                time.sleep(_OPEN_RETRY_SETTLE_SEC)
+                # Tell the UI we're reconnecting, then back off so the device /
+                # driver has time to finish a USB wakeup / MME WaveIn re-arm /
+                # re-enumeration. No cache refresh.
+                if on_retry is not None:
+                    try:
+                        on_retry(attempt + 1, _OPEN_MAX_ATTEMPTS)
+                    except Exception:
+                        pass
+                backoff = _OPEN_RETRY_BACKOFF_SEC[
+                    min(attempt - 1, len(_OPEN_RETRY_BACKOFF_SEC) - 1)
+                ]
+                time.sleep(backoff)
 
+            # Re-resolve BY NAME every attempt — the index can shift on
+            # re-enumeration, and a device absent now may reappear mid-window.
             try:
                 device_index = self._resolve_device_for_capture()
             except RuntimeError as e:
-                # Configured mic genuinely not in the current device list —
-                # no point retrying without external state changing.
-                raise
+                # Configured mic not in the CURRENT list. On a USB-suspend wake
+                # it often reappears within a second or two, so treat this as a
+                # retryable condition within the attempt budget rather than
+                # failing the press outright.
+                last_err = e
+                logging.warning(
+                    f"Microphone not resolved (attempt {attempt + 1}/"
+                    f"{_OPEN_MAX_ATTEMPTS}): {e}"
+                )
+                continue
 
             capture_sr = self._query_native_samplerate(device_index)
 
@@ -200,7 +233,10 @@ class AudioRecorder:
                 if attempt == 0:
                     logging.info(f"Recording at native {capture_sr} Hz")
                 else:
-                    logging.info(f"Recording at native {capture_sr} Hz (recovered on attempt {attempt + 1})")
+                    logging.info(
+                        f"Recording at native {capture_sr} Hz "
+                        f"(recovered on attempt {attempt + 1})"
+                    )
                 return  # success
             except Exception as e:
                 # Roll back so a failed open can't wedge the recording state.
@@ -208,13 +244,17 @@ class AudioRecorder:
                     self.is_recording = False
                 self._stream = None
                 last_err = e
+                is_9999 = "-9999" in str(e) or "out of range" in str(e).lower()
                 logging.warning(
-                    f"InputStream open failed (attempt {attempt + 1}): {e}"
+                    f"InputStream open failed (attempt {attempt + 1}/"
+                    f"{_OPEN_MAX_ATTEMPTS}"
+                    f"{'; -9999 device out of range' if is_9999 else ''}): {e}"
                 )
 
         # All attempts exhausted — surface the last error to the caller.
-        assert last_err is not None
-        raise last_err
+        raise last_err if last_err is not None else RuntimeError(
+            "Не удалось открыть микрофон"
+        )
 
     def stop_recording(self) -> tuple[bytes, int]:
         """Stop recording and return audio data as WAV bytes and duration in ms"""

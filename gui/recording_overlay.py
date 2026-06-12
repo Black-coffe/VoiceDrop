@@ -230,6 +230,24 @@ class RecordingOverlay:
         if self._status_label:
             self._status_label.config(text="Обработка...")
 
+    def show_connecting(self, parent: tk.Tk):
+        """Show a 'reconnecting microphone' state during mic open retries (A4).
+
+        The stream isn't open yet (so the waveform stays flat); this just tells
+        the user the press registered and we're waiting on the device to wake.
+        """
+        if self._window is None:
+            self._create_window(parent)
+        self._is_visible = True
+        if self._window:
+            self._window.deiconify()
+            self._window.lift()
+        if self._status_label:
+            try:
+                self._status_label.config(text="Подключаю микрофон…", fg='#ffd166')
+            except Exception:
+                pass
+
     def show_polish_partial(self, partial_text: str):
         """Show the tail of the polished text as it streams in.
 

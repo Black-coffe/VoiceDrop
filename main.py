@@ -360,8 +360,10 @@ class VoiceDropApp:
                 winsound.Beep(600, 50)
 
             # 1) START CAPTURE IMMEDIATELY — no blocking work before this.
+            # on_retry surfaces "Подключаю микрофон…" in the overlay while the
+            # recorder re-resolves + backs off through a USB-suspend wake (A4).
             try:
-                self.audio_recorder.start_recording()
+                self.audio_recorder.start_recording(on_retry=self._on_mic_retry)
             except Exception as e:
                 logging.error(f"Failed to start recording: {e}", exc_info=True)
                 with self._lock:
@@ -425,6 +427,15 @@ class VoiceDropApp:
             logging.error(f"Unexpected error in _on_hotkey_press: {e}", exc_info=True)
             with self._lock:
                 self._is_recording = False
+
+    def _on_mic_retry(self, attempt: int, total: int):
+        """Called by AudioRecorder before each mic-open retry (A4). Logs the
+        attempt and shows a 'reconnecting' state in the overlay."""
+        logging.info(f"Reconnecting microphone… (attempt {attempt}/{total})")
+        if self._root and self.recording_overlay:
+            self._root.after(
+                0, lambda: self.recording_overlay.show_connecting(self._root)
+            )
 
     def _mute_worker(self, session_id: int):
         """Mute other audio sessions for a given record session.
