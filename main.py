@@ -129,6 +129,7 @@ from core.elevenlabs_ws import (
 from core.hotkey_manager import HotkeyManager
 from core.keyterms import KeyTerms
 from core.pending_queue import PendingQueue
+from core.pipeline import TextPipeline
 from core.profiles import ProfileManager
 from core.text_replacer import TextReplacer
 from core.text_polisher import TextPolisher
@@ -176,6 +177,12 @@ class VoiceDropApp:
         self.voice_commands = VoiceCommands()
         self.key_terms = KeyTerms()  # B2: hot-reloaded keyterms.json (opt-in)
         self.profiles = ProfileManager()
+        # E1: pure post-STT transform chain (polish→dict→commands→code-style).
+        # Side effects (overlay/insert/history/usage) stay here in main.
+        self.text_pipeline = TextPipeline(
+            self.text_polisher, self.text_replacer,
+            self.voice_commands, self.profiles,
+        )
         self.usage = UsageTracker()
         self.realtime_transcriber = RealtimeTranscriber(ELEVENLABS_API_KEY)
         # Dedicated asyncio loop in a daemon thread for realtime WS sessions.
@@ -707,31 +714,25 @@ class VoiceDropApp:
         if forced_mode == "code":
             logging.info("Code-mode modifier held -> raw (no polish) for this clip")
 
-        # Optional LLM polish — text mode only (code mode stays verbatim).
-        # Best-effort: returns original on error.
-        polish_sec = 0.0
-        if mode == "text" and self._get_polish_enabled():
-            # Stream the polish into the overlay as it arrives — UX-only,
-            # the actual paste below still uses the FINAL completed text.
-            def _on_polish_partial(partial: str):
-                if self.recording_overlay and self._root:
-                    self._root.after(
-                        0,
-                        lambda p=partial: self.recording_overlay.show_polish_partial(p),
-                    )
-            _polish_t0 = time.monotonic()
-            text = self.text_polisher.polish(
-                text, language=language, on_partial=_on_polish_partial,
-                min_words=self._get_polish_min_words(),  # C2: skip on short clips
-            )
-            polish_sec = time.monotonic() - _polish_t0
-        # Custom dictionary: fix tech terms / names STT mangles (local, instant)
-        text = self.text_replacer.apply(text)
-        # Voice formatting commands: "новая строка", "код блок", ... -> symbols
-        text = self.voice_commands.apply(text)
-        # Code mode: verbatim style (drop trailing period, lowercase Latin start)
-        if mode == "code":
-            text = self.profiles.apply_code_style(text)
+        # Stream the polish into the overlay as it arrives — UX-only, the actual
+        # paste below still uses the FINAL completed text.
+        def _on_polish_partial(partial: str):
+            if self.recording_overlay and self._root:
+                self._root.after(
+                    0,
+                    lambda p=partial: self.recording_overlay.show_polish_partial(p),
+                )
+
+        # E1: the pure transform chain (polish→dictionary→commands→code-style)
+        # lives in core/pipeline.py now; the side effects below stay here.
+        text, polish_sec = self.text_pipeline.process(
+            text,
+            mode=mode,
+            language=language,
+            polish=self._get_polish_enabled(),       # text-mode gating is in process()
+            polish_min_words=self._get_polish_min_words(),  # C2
+            on_polish_partial=_on_polish_partial,
+        )
 
         # Show word count on overlay
         word_count = len(text.split())
