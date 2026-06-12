@@ -210,9 +210,11 @@ class VoiceDropApp:
         self._last_duration_ms = 0
         self._last_text = ""  # last produced text (for tray "Скопировать последнее")
 
-        # Force unmute all audio on startup (in case previous instance crashed)
-        logging.info("Force unmuting all audio on startup...")
-        self.audio_muter.force_unmute_all()
+        # Safety unmute on startup (D2): if a previous instance was killed mid-
+        # recording (kill / BSOD), the apps we muted stay muted forever. Clear
+        # them now, plus a delayed second sweep for sessions that only become
+        # enumerable a moment after launch (the muted app resumes audio).
+        self._safety_unmute_on_startup()
 
         # Load saved settings and get hotkey VK codes
         self._saved_hotkey_vks = self._apply_saved_settings()
@@ -432,6 +434,31 @@ class VoiceDropApp:
             logging.error(f"Unexpected error in _on_hotkey_press: {e}", exc_info=True)
             with self._lock:
                 self._is_recording = False
+
+    def _safety_unmute_on_startup(self):
+        """D2: clear any mutes left behind by a crashed previous instance.
+
+        Runs an immediate force-unmute (non-whitelisted sessions that are still
+        muted) plus one delayed re-sweep ~3 s later — a muted app whose audio
+        session wasn't active at process launch (paused at crash time) only
+        becomes enumerable once it resumes, and would otherwise stay muted.
+        """
+        logging.info("Safety unmute on startup (D2)...")
+        try:
+            self.audio_muter.force_unmute_all()
+        except Exception as e:
+            logging.error(f"Startup force_unmute_all failed: {e}", exc_info=True)
+
+        def _delayed_sweep():
+            try:
+                self.audio_muter.force_unmute_all()
+                logging.debug("Startup delayed unmute sweep done (D2)")
+            except Exception as e:
+                logging.debug(f"Startup delayed unmute sweep failed: {e}")
+
+        t = threading.Timer(3.0, _delayed_sweep)
+        t.daemon = True
+        t.start()
 
     def _on_mic_retry(self, attempt: int, total: int):
         """Called by AudioRecorder before each mic-open retry (A4). Logs the
