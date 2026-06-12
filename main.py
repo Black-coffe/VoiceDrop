@@ -167,6 +167,11 @@ class VoiceDropApp:
         self.pending_queue = PendingQueue()
         self.text_replacer = TextReplacer()
         self.text_polisher = TextPolisher()
+        # Surface repeated polish failures instead of silently pasting raw text
+        # (A5). Reason is shown once via tray notification + marked in the menu.
+        self._polish_failure_reason: Optional[str] = None
+        self.text_polisher.on_repeated_failure = self._on_polish_repeated_failure
+        self.text_polisher.on_recovered = self._on_polish_recovered
         self.voice_commands = VoiceCommands()
         self.profiles = ProfileManager()
         self.usage = UsageTracker()
@@ -964,6 +969,30 @@ class VoiceDropApp:
             state = "включена" if new_value else "выключена"
             self.tray_icon.show_notification("VoiceDrop — полировка", f"LLM-полировка {state}")
 
+    def _on_polish_repeated_failure(self, reason: str):
+        """Polish failed ≥2× in a row (A5). Tell the user ONCE — the text is
+        still inserted, just un-polished — and flag it in the tray menu."""
+        self._polish_failure_reason = reason
+        if self.tray_icon:
+            self.tray_icon.show_notification(
+                "VoiceDrop — полировка недоступна",
+                f"Polish временно не работает: {reason}. "
+                f"Текст вставляется без полировки."
+            )
+            self.tray_icon.update_menu()
+
+    def _on_polish_recovered(self):
+        """First successful polish after a failure run — clear the warning."""
+        if self._polish_failure_reason is not None:
+            self._polish_failure_reason = None
+            logging.info("Polish recovered; clearing tray warning")
+            if self.tray_icon:
+                self.tray_icon.update_menu()
+
+    def _get_polish_status(self) -> Optional[str]:
+        """None when polish is healthy; else the last failure reason (tray mark)."""
+        return self._polish_failure_reason
+
     def _get_mode(self) -> str:
         """Dictation mode setting: 'auto' | 'text' | 'code' (default auto)."""
         return load_settings().get('dictation_mode', 'auto')
@@ -1286,6 +1315,7 @@ class VoiceDropApp:
             get_language=self._get_language,
             on_toggle_polish=self._toggle_polish,
             get_polish_enabled=self._get_polish_enabled,
+            get_polish_status=self._get_polish_status,
             on_set_mode=self._set_mode,
             get_mode=self._get_mode,
             on_retranscribe=self._retranscribe_last,

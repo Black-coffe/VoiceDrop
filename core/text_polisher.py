@@ -24,6 +24,10 @@ _API_URL = "https://api.anthropic.com/v1/messages"
 _TIMEOUT = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0)
 _MIN_CHARS = 12      # skip ultra-short utterances (not worth latency/cost)
 _MAX_TOKENS = 2048
+# Notify the user after this many CONSECUTIVE polish failures. The field bug:
+# Anthropic "credit balance too low" failed polish 16× in a row over a whole
+# day and text was silently pasted un-polished with no signal (roadmap A5).
+_FAILURE_NOTIFY_THRESHOLD = 2
 
 _SYSTEM_PROMPT = (
     "Ты — корректор надиктованного текста, НЕ собеседник и НЕ ассистент. "
@@ -59,6 +63,19 @@ class TextPolisher:
         self.model = model or POLISH_MODEL
         self._client: Optional[httpx.Client] = None
         self._warned_no_key = False
+
+        # --- Repeated-failure tracking (A5) ---------------------------------
+        # Polish is best-effort and silently returns the original text on any
+        # error. That hid a full day of "credit balance too low". We now count
+        # consecutive failures and fire on_repeated_failure exactly once when we
+        # cross the threshold; on_recovered fires on the first success after a
+        # notification. Reason is a short human-readable string.
+        self._consecutive_failures = 0
+        self._failure_notified = False
+        self._last_failure_reason: Optional[str] = None
+        self._last_api_error: Optional[str] = None  # set by the HTTP helpers
+        self.on_repeated_failure: Optional[Callable[[str], None]] = None
+        self.on_recovered: Optional[Callable[[], None]] = None
 
     def _get_client(self) -> httpx.Client:
         if self._client is None or self._client.is_closed:
@@ -113,6 +130,7 @@ class TextPolisher:
 
         try:
             t0 = time.time()
+            self._last_api_error = None
             if on_partial is None:
                 cleaned = self._polish_blocking(headers, payload)
             else:
@@ -120,7 +138,12 @@ class TextPolisher:
                 cleaned = self._polish_streaming(headers, payload, on_partial)
 
             if cleaned is None:
-                return text  # API error already logged by helper
+                # API-level error (non-200). The helper set _last_api_error.
+                self._note_failure(self._last_api_error or "ошибка Anthropic")
+                return text
+            # API call succeeded (even if it returns empty / over-expanded text,
+            # the SERVICE works — that's not a credit/auth failure).
+            self._note_success()
             # In case the model echoes the wrapper tags despite instructions.
             cleaned = (
                 cleaned.replace("<recognized_speech>", "")
@@ -143,14 +166,69 @@ class TextPolisher:
             logging.info(f"Polished in {time.time() - t0:.2f}s")
             return cleaned
         except Exception as e:
+            # Transport-level failure (offline, timeout, connection reset).
+            self._note_failure(self._reason_from_exception(e))
             logging.warning(f"Polish failed ({e}); using original text")
             return text
+
+    # --- Failure bookkeeping (A5) -------------------------------------------
+
+    def _note_failure(self, reason: str):
+        """Record a polish failure; fire on_repeated_failure once at threshold."""
+        self._consecutive_failures += 1
+        self._last_failure_reason = reason
+        if (self._consecutive_failures >= _FAILURE_NOTIFY_THRESHOLD
+                and not self._failure_notified):
+            self._failure_notified = True
+            logging.error(
+                f"Polish failed {self._consecutive_failures}× in a row: {reason}"
+            )
+            if self.on_repeated_failure:
+                try:
+                    self.on_repeated_failure(reason)
+                except Exception as cb_err:
+                    logging.debug(f"on_repeated_failure callback error: {cb_err}")
+
+    def _note_success(self):
+        """Reset the failure counter; fire on_recovered if we'd notified."""
+        if self._failure_notified:
+            logging.info("Polish recovered after previous failures")
+            if self.on_recovered:
+                try:
+                    self.on_recovered()
+                except Exception as cb_err:
+                    logging.debug(f"on_recovered callback error: {cb_err}")
+        self._consecutive_failures = 0
+        self._failure_notified = False
+        self._last_failure_reason = None
+
+    @staticmethod
+    def _reason_from_status(status: int, body: str) -> str:
+        """Short human-readable reason from an Anthropic non-200 response."""
+        low = (body or "").lower()
+        if "credit balance" in low or ("insufficient" in low and "credit" in low):
+            return "закончились кредиты Anthropic"
+        if status in (401, 403):
+            return "проблема с ключом Anthropic"
+        if status == 429:
+            return "лимит запросов Anthropic (429)"
+        return f"ошибка Anthropic ({status})"
+
+    @staticmethod
+    def _reason_from_exception(e: Exception) -> str:
+        import httpx as _httpx
+        if isinstance(e, (_httpx.ConnectError, _httpx.ConnectTimeout)):
+            return "нет связи с Anthropic"
+        if isinstance(e, _httpx.TimeoutException):
+            return "таймаут Anthropic"
+        return f"сбой polish ({type(e).__name__})"
 
     def _polish_blocking(self, headers: dict, payload: dict) -> Optional[str]:
         """Non-streaming path. Returns the cleaned string, or None on API error."""
         resp = self._get_client().post(_API_URL, headers=headers, json=payload)
         if resp.status_code != 200:
             logging.warning(f"Polish API {resp.status_code}: {resp.text[:200]}")
+            self._last_api_error = self._reason_from_status(resp.status_code, resp.text)
             return None
         data = resp.json()
         return "".join(
@@ -171,6 +249,7 @@ class TextPolisher:
                 # Read body for the warning, then bail out.
                 body = resp.read().decode("utf-8", errors="replace")[:200]
                 logging.warning(f"Polish API {resp.status_code}: {body}")
+                self._last_api_error = self._reason_from_status(resp.status_code, body)
                 return None
             for line in resp.iter_lines():
                 if not line:

@@ -65,6 +65,7 @@ class TrayIcon:
         get_language: Optional[Callable[[], Optional[str]]] = None,
         on_toggle_polish: Optional[Callable[[], None]] = None,
         get_polish_enabled: Optional[Callable[[], bool]] = None,
+        get_polish_status: Optional[Callable[[], Optional[str]]] = None,
         on_set_mode: Optional[Callable[[str], None]] = None,
         get_mode: Optional[Callable[[], str]] = None,
         on_retranscribe: Optional[Callable[[str], None]] = None,
@@ -87,6 +88,7 @@ class TrayIcon:
         self.get_language = get_language
         self.on_toggle_polish = on_toggle_polish
         self.get_polish_enabled = get_polish_enabled
+        self.get_polish_status = get_polish_status
         self.on_set_mode = on_set_mode
         self.get_mode = get_mode
         self.on_retranscribe = on_retranscribe
@@ -154,7 +156,7 @@ class TrayIcon:
                 Item("English", lambda icon, item: self._handle_retranscribe("en")),
             )),
             Item(
-                "Полировка текста (LLM)",
+                self._polish_label,
                 lambda icon, item: self._handle_toggle_polish(),
                 checked=lambda item: self._current_polish(),
             ),
@@ -294,6 +296,17 @@ class TrayIcon:
                 return False
         return False
 
+    def _polish_label(self, item) -> str:
+        """Polish toggle label, marked with a warning when polish is failing (A5)."""
+        base = "Полировка текста (LLM)"
+        status = None
+        if self.get_polish_status:
+            try:
+                status = self.get_polish_status()
+            except Exception:
+                status = None
+        return f"{base} ⚠ {status}" if status else base
+
     def _handle_toggle_polish(self):
         """Toggle LLM polish (off the tray thread)."""
         if self.on_toggle_polish:
@@ -382,3 +395,12 @@ class TrayIcon:
         """Show a notification"""
         if self._icon:
             self._icon.notify(message, title)
+
+    def update_menu(self):
+        """Re-render the tray menu (re-evaluates dynamic labels like the polish
+        warning mark). Safe no-op before the icon is running."""
+        if self._icon:
+            try:
+                self._icon.update_menu()
+            except Exception as e:
+                logging.debug(f"Tray update_menu failed: {e}")
