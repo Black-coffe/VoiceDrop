@@ -149,8 +149,8 @@ HTTP-соединение 60+ секунд. Сложно без публично
 
 ## C. Латентность (отпустил хоткей → текст в окне)
 
-### C1. Адаптивный drain хвоста realtime по таймстемпам ✅ DONE
-**P1 · M · `core/elevenlabs_ws.py:53-62`** — выполнено (commit B3+C1, 2026-06-12): `include_timestamps=true`, копим max end-таймстемп committed-слов; как только покрытие достигло отправленного аудио (slack 300 мс) — завершаем сессию сразу. 2.5с-idle оставлен fallback'ом (многосегментный путь 1f5696f не тронут). Ожидаемый выигрыш −1.5…2 с/клип. Регресс-тесты: ранний выход при покрытии / fallback при недопокрытии (hanging fake socket).
+### C1. Адаптивный drain хвоста realtime по таймстемпам ⚠️ ОТКАЧЕН В OPT-IN (живой тест выявил потерю начала)
+**P1 · M · `core/elevenlabs_ws.py`** — реализован (commit B3+C1), НО живой тест 2026-06-12 показал: `include_timestamps=true` заставляет сервер дублировать committed-события и коммитить начало длинного клипа ПУСТЫМ → терялись первые ~36 с 52-секундной диктовки. C1 не прошёл критерий «без потери текста». Откачен в opt-in (`settings.rt_include_timestamps`, default false; commit «fix(rt): make C1 timestamp drain opt-in»). По умолчанию — проверенный путь сессии 3 (одиночные committed + 2.5с-idle). Код drain'а сохранён, спит. См. memory [[c1-timestamps-truncation]]. Перед повторным включением — живой тест на длинном клипе + дедуп committed.
 Сейчас после каждого committed ждём `_TAIL_IDLE_SEC=2.5` с — это чистая добавка к
 латентности каждого клипа (в логах: финал через ~2.5 с после последнего сегмента).
 Включить `committed_transcript_with_timestamps` и завершать сессию сразу, как только
@@ -242,8 +242,8 @@ destroyed» и риск потери клипа при выходе во вре�
 
 ## E. Рефакторинг и качество кода
 
-### E1. Разбить god-object `main.py` (1270 строк, 60+ методов)
-**P1 · L · `main.py`**
+### E1. Разбить god-object `main.py` (1270 строк, 60+ методов) ✅ DONE (частично)
+**P1 · L · `main.py`** — выполнено частично (commit E1, 2026-06-12): чистый post-STT transform (polish→словарь→команды→code-style) вынесен в `core/pipeline.py::TextPipeline` (без UI/IO/потоков, юнит-тестируемый, шов для F4). `main._finish_text` делегирует в него, побочные эффекты остаются в main. `gui/app_controller.py` (tray/окна/уведомления) ОТЛОЖЕН: сильно связан с состоянием+потоками, риск высок, выгода мала — отдельным заходом.
 Выделить: `core/pipeline.py` (запись→STT→polish→вставка→история — чистая логика,
 тестируемая), `gui/app_controller.py` (tray/окна/уведомления), `main.py` остаётся
 композиция + lifecycle. Делать ПОСЛЕ блока A (чтобы не таскать конфликты), идеально —
@@ -276,13 +276,11 @@ Headers/payload повторяются в blocking и streaming варианта
 
 ## F. Тесты (сейчас покрыты только WS, resample, warmup, polish-streaming)
 
-### F1. Тесты pending-очереди
-**P1 · M** — вместе с A2: постоянная ошибка → dead-letter; временная → ретрай; TTL;
-повреждённый sidecar-json.
+### F1. Тесты pending-очереди ✅ DONE
+**P1 · M** — выполнено (dead-letter/TTL в сессии 1, добавлено в сессии 6: битый sidecar-json пропускается, orphan .wav без sidecar не листится, read_audio round-trip, enforce-cap, идемпотентный remove). `tests/test_pending_queue.py`.
 
-### F2. Тесты hotkey_manager
-**P1 · M** — VK-матчинг: L/R модификаторы, exact-match правых, modifier_was_held
-(per-clip code mode), залипание при потере фокуса. Логика сложная и ни разу не покрыта.
+### F2. Тесты hotkey_manager ✅ DONE
+**P1 · M** — выполнено (commit F1+F2, 2026-06-12): `tests/test_hotkey_manager.py` — нормализация L/R VK, exact-match при правом модификаторе в хоткее, гибкий L/R матч, press/release state-machine, modifier_was_held (latch до и во время активации), no-refire-while-held, set_hotkey reset. (10 тестов.)
 
 ### F3. Тесты db_manager
 **P2 · M** — FTS5-поиск (кириллица, диакритика), retention, UTC↔local конверсия
@@ -411,7 +409,7 @@ Headers/payload повторяются в blocking и streaming варианта
 3. **Сессия 3:** B1+B2+B4+C2 (качество/цена ElevenLabs). ✅ ВЫПОЛНЕНО 2026-06-12.
 4. **Сессия 4:** B3+C1+C5 (+B5) (realtime VAD + латентность; аккуратно, нужны регресс-тесты WS). ✅ ВЫПОЛНЕНО 2026-06-12 (B3+C1+C5; B5 не делали).
 5. **Сессия 5:** G1+G2 (overlay/субтитры). ✅ ВЫПОЛНЕНО 2026-06-12.
-6. **Сессия 6:** E1+F1+F2 (рефакторинг ядра под тестами).
+6. **Сессия 6:** E1+F1+F2 (рефакторинг ядра под тестами). ✅ ВЫПОЛНЕНО 2026-06-12 (+ откат C1 в opt-in после живого теста). app_controller отложен.
 7. Дальше — по желанию из P2/P3.
 
 Перед каждой сессией: прочитать memory проекта (mic-saga-state, level-b-realtime-stt —
