@@ -751,13 +751,16 @@ class VoiceDropApp:
         # Deliver text per the chosen insert mode
         insert_mode = self._get_insert_mode()
         _insert_t0 = time.monotonic()
+        paste_failed = False
         if insert_mode == "clipboard":
             self.text_inserter.copy_to_clipboard(text)
             inserted = False
         elif insert_mode == "enter":
             inserted = self.text_inserter.insert_text(text, press_enter=True)
+            paste_failed = not inserted
         else:  # "window"
             inserted = self.text_inserter.insert_text(text)
+            paste_failed = not inserted
         insert_sec = time.monotonic() - _insert_t0
 
         # Save to database (unless history saving is disabled for privacy)
@@ -765,8 +768,14 @@ class VoiceDropApp:
             self.db.save_recording(text, duration_ms, was_inserted=inserted)
         self.usage.record(duration_ms, len(text), mode=stt_mode)
 
-        # Play success sound
-        winsound.Beep(800, 100)  # Short high-pitched beep
+        # D1: a window/enter paste with no focused field is a SILENT loss — the
+        # text is safe in the clipboard + history, so tell the user to paste it
+        # manually instead of it just vanishing. (We don't auto-retry: double
+        # paste risk.) Otherwise play the normal success cue.
+        if paste_failed:
+            self._notify_paste_failed()
+        else:
+            winsound.Beep(800, 100)  # Short high-pitched beep
 
         # C5: one line per clip for the whole release→inserted pipeline, so the
         # effect of every latency change (C1/C2/C3…) is visible at a glance.
@@ -779,6 +788,18 @@ class VoiceDropApp:
         )
 
         logging.info(f"Done! Text: {text}")
+
+    def _notify_paste_failed(self):
+        """D1: the paste had no target. Text is in the clipboard + History —
+        tell the user to paste manually instead of losing it silently."""
+        logging.warning("Paste had no focused target — text kept in clipboard")
+        winsound.Beep(500, 150)  # distinct from the success beep
+        msg = "Некуда вставить — текст в буфере обмена, вставьте вручную (Ctrl+V)"
+        if self.recording_overlay and self._root:
+            self._root.after(0, lambda: self.recording_overlay.show_error(msg))
+            self._root.after(3000, self.recording_overlay.hide)
+        if self.tray_icon:
+            self.tray_icon.show_notification("VoiceDrop — вставка не удалась", msg)
 
     def _process_audio_realtime(self, audio_data: bytes, duration_ms: int,
                                 forced_mode: Optional[str],

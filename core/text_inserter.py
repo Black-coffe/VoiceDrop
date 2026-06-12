@@ -2,6 +2,7 @@
 Text Inserter - Inserts text at cursor position
 Uses Windows API for reliable key simulation
 """
+import logging
 import time
 import ctypes
 from ctypes import wintypes
@@ -17,9 +18,48 @@ KEYEVENTF_KEYUP = 0x0002
 user32 = ctypes.windll.user32
 
 
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+
 class TextInserter:
     def __init__(self):
         pass
+
+    def _has_paste_target(self) -> bool:
+        """True if the foreground window has a control with keyboard focus —
+        i.e. somewhere Ctrl+V can actually land (D1).
+
+        If there's no foreground window or no focused control, a paste would be
+        silently lost (read-only context, desktop, a window that took no focus),
+        so the caller keeps the text in the clipboard and tells the user instead
+        of losing it. Best-effort: on any API hiccup we assume a target exists
+        (never block a paste that might have worked).
+        """
+        try:
+            fg = user32.GetForegroundWindow()
+            if not fg:
+                return False
+            tid = user32.GetWindowThreadProcessId(fg, None)
+            gti = _GUITHREADINFO()
+            gti.cbSize = ctypes.sizeof(_GUITHREADINFO)
+            if user32.GetGUIThreadInfo(tid, ctypes.byref(gti)):
+                return bool(gti.hwndFocus)
+            # API failed — don't block the paste.
+            return True
+        except Exception as e:
+            logging.debug(f"paste-target check failed (assuming ok): {e}")
+            return True
 
     def _send_key(self, vk_code: int, key_up: bool = False):
         """Send a key event using Windows API"""
@@ -52,17 +92,28 @@ class TextInserter:
             press_enter: send Enter after pasting (auto-send in chats)
 
         Returns:
-            True if successful, False otherwise
+            True if the text was pasted into a focused field; False if there was
+            no paste target (text is left in the clipboard for manual paste) or
+            on error. The caller surfaces the False case to the user (D1).
         """
         if not text:
             return False
 
         try:
-            # Copy text to clipboard
+            # Copy text to clipboard FIRST — so even if there's no paste target,
+            # the text is safe and the user can Ctrl+V it manually.
             pyperclip.copy(text)
 
             # Small delay to ensure clipboard is updated
             time.sleep(0.1)
+
+            # D1: if nothing is focused, Ctrl+V would be silently lost. Don't
+            # send it (no point, and it avoids any chance of a stray paste);
+            # report failure so the caller notifies the user. The text is
+            # already in the clipboard above.
+            if not self._has_paste_target():
+                logging.info("No paste target (no focused field) — text left in clipboard")
+                return False
 
             # Simulate Ctrl+V to paste
             self._paste()
@@ -79,7 +130,7 @@ class TextInserter:
             return True
 
         except Exception as e:
-            print(f"Error inserting text: {e}")
+            logging.error(f"Error inserting text: {e}", exc_info=True)
             return False
 
     def copy_to_clipboard(self, text: str) -> bool:
