@@ -110,8 +110,8 @@ class HistoryWindow(ctk.CTkToplevel):
         """
         Args:
             usage_provider: returns a dict with today_min/today_cost/month_min/
-                month_cost/cost_per_hour for the bottom-row metrics. None →
-                metrics row is hidden.
+                month_cost (+ optional batch/realtime split) for the bottom-row
+                metrics. None → metrics row is hidden.
             balance_provider: returns the ElevenLabs subscription dict (used/
                 limit/reset_unix) or None on failure. None → balance is shown
                 as "—".
@@ -482,6 +482,12 @@ class HistoryWindow(ctk.CTkToplevel):
             m_cost = u.get("month_cost", 0.0)
             parts.append(f"Сегодня {t_min:.1f} мин (≈${t_cost:.2f})")
             parts.append(f"Месяц {m_min:.1f} мин (≈${m_cost:.2f})")
+            # Batch/realtime split (B4) — only when realtime has been used, to
+            # keep the footer compact for batch-only users.
+            m_rt = u.get("month_min_realtime", 0.0)
+            if m_rt > 0.05:
+                m_b = u.get("month_min_batch", 0.0)
+                parts.append(f"(батч {m_b:.1f} / realtime {m_rt:.1f} мин)")
 
         # Remote subscription balance — best-effort
         if self._balance_provider is not None:

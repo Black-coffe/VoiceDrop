@@ -620,7 +620,8 @@ class VoiceDropApp:
                 return
 
             text = text.strip()
-            self._finish_text(text, audio_data, duration_ms, forced_mode, language)
+            self._finish_text(text, audio_data, duration_ms, forced_mode, language,
+                              stt_mode="batch")
 
         except TranscriptionError as e:
             # Transcription failed after retries. Queue it for auto-resend if the
@@ -667,7 +668,8 @@ class VoiceDropApp:
                 self._is_processing = False
 
     def _finish_text(self, text: str, audio_data: bytes, duration_ms: int,
-                     forced_mode: Optional[str], language: Optional[str]):
+                     forced_mode: Optional[str], language: Optional[str],
+                     stt_mode: str = "batch"):
         """Post-STT pipeline shared by batch and realtime paths.
 
         Takes a non-empty, stripped transcript and runs: polish → dictionary
@@ -692,7 +694,8 @@ class VoiceDropApp:
                         lambda p=partial: self.recording_overlay.show_polish_partial(p),
                     )
             text = self.text_polisher.polish(
-                text, language=language, on_partial=_on_polish_partial
+                text, language=language, on_partial=_on_polish_partial,
+                min_words=self._get_polish_min_words(),  # C2: skip on short clips
             )
         # Custom dictionary: fix tech terms / names STT mangles (local, instant)
         text = self.text_replacer.apply(text)
@@ -729,7 +732,7 @@ class VoiceDropApp:
         # Save to database (unless history saving is disabled for privacy)
         if self._get_save_history():
             self.db.save_recording(text, duration_ms, was_inserted=inserted)
-        self.usage.record(duration_ms, len(text))
+        self.usage.record(duration_ms, len(text), mode=stt_mode)
 
         # Play success sound
         winsound.Beep(800, 100)  # Short high-pitched beep
@@ -819,7 +822,8 @@ class VoiceDropApp:
                     self._root.after(0, self.recording_overlay.hide)
                 return
             logging.info(f"Realtime transcript ({duration_ms} ms): {text[:80]}...")
-            self._finish_text(text, audio_data, duration_ms, forced_mode, language)
+            self._finish_text(text, audio_data, duration_ms, forced_mode, language,
+                              stt_mode="realtime")
 
         except Exception as e:
             logging.error(f"Error processing realtime audio: {e}", exc_info=True)
@@ -1046,6 +1050,25 @@ class VoiceDropApp:
             read_timeout=s.get('request_timeout_sec'),
         )
 
+    def _get_polish_min_words(self) -> int:
+        """Skip polish for clips shorter than this many words (C2, default 8)."""
+        try:
+            return max(0, int(load_settings().get('polish_min_words', 8)))
+        except (TypeError, ValueError):
+            return 8
+
+    def _stt_rates(self) -> tuple:
+        """(cost_batch, cost_realtime) per hour from settings (B4 defaults)."""
+        s = load_settings()
+
+        def _f(key: str, dflt: float) -> float:
+            try:
+                return float(s.get(key, dflt))
+            except (TypeError, ValueError):
+                return dflt
+
+        return _f('stt_cost_batch', 0.22), _f('stt_cost_realtime', 0.39)
+
     def _get_save_history(self) -> bool:
         """Whether transcriptions are saved to the history DB (default on)."""
         return bool(load_settings().get('save_history', True))
@@ -1102,17 +1125,15 @@ class VoiceDropApp:
             self.tray_icon.show_notification("VoiceDrop", "Нет последнего текста")
 
     def _show_usage(self):
-        """Show ElevenLabs STT usage (requests, audio minutes, estimated cost)."""
-        rate = load_settings().get('stt_cost_per_hour', 0.40)
-        try:
-            rate = float(rate)
-        except (TypeError, ValueError):
-            rate = 0.40
-        s = self.usage.summary(cost_per_hour=rate)
+        """Show ElevenLabs STT usage (requests, audio minutes, estimated cost),
+        split by batch vs realtime since they bill at different rates (B4)."""
+        cb, cr = self._stt_rates()
+        s = self.usage.summary(cost_batch=cb, cost_realtime=cr)
         msg = (
             f"Сегодня: {s['today_requests']} зап., {s['today_min']:.1f} мин (≈${s['today_cost']:.3f})\n"
             f"Всего: {s['total_requests']} зап., {s['total_min']:.1f} мин (≈${s['total_cost']:.2f})\n"
-            f"Ставка ≈${rate:g}/час (stt_cost_per_hour в settings.json)"
+            f"  батч {s['total_min_batch']:.1f} мин @${cb:g}/ч · "
+            f"realtime {s['total_min_realtime']:.1f} мин @${cr:g}/ч"
         )
         logging.info("Usage summary requested: " + msg.replace("\n", " | "))
         if self.tray_icon:
@@ -1195,16 +1216,12 @@ class VoiceDropApp:
         self.history_window.show()
 
     def _usage_snapshot(self) -> dict:
-        """Today + month-to-date local usage, evaluated each refresh so a
-        live setting change to stt_cost_per_hour takes effect immediately."""
-        rate = load_settings().get('stt_cost_per_hour', 0.40)
-        try:
-            rate = float(rate)
-        except (TypeError, ValueError):
-            rate = 0.40
-        s = self.usage.summary(cost_per_hour=rate)
-        m = self.usage.month_summary(cost_per_hour=rate)
-        return {**s, **m, "cost_per_hour": rate}
+        """Today + month-to-date local usage, evaluated each refresh so a live
+        change to the batch/realtime rates takes effect immediately (B4)."""
+        cb, cr = self._stt_rates()
+        s = self.usage.summary(cost_batch=cb, cost_realtime=cr)
+        m = self.usage.month_summary(cost_batch=cb, cost_realtime=cr)
+        return {**s, **m, "cost_batch": cb, "cost_realtime": cr}
 
     def _show_settings(self):
         """Show settings window"""

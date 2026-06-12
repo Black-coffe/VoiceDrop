@@ -83,7 +83,8 @@ class TextPolisher:
         return self._client
 
     def polish(self, text: str, language: Optional[str] = None,
-               on_partial: Optional[Callable[[str], None]] = None) -> str:
+               on_partial: Optional[Callable[[str], None]] = None,
+               min_words: int = 0) -> str:
         """Return cleaned text, or the original on any problem (never raises).
 
         If ``on_partial`` is given, polish via Anthropic SSE streaming and call
@@ -92,8 +93,18 @@ class TextPolisher:
         swallowed (must NOT break the polish pipeline). The final paste still
         uses the FULL completed result — partial-text delivery is overlay-only,
         which keeps push-to-talk paste atomic.
+
+        ``min_words`` (C2): skip the LLM call entirely for clips shorter than
+        this many words. With no_verbatim cleaning fillers at the STT side and
+        Scribe adding punctuation, a 1-2 s clip gains little from polish but
+        still pays its 1-3 s latency — so short clips skip it.
         """
         if not text or len(text.strip()) < _MIN_CHARS:
+            return text
+        if min_words > 0 and len(text.split()) < min_words:
+            logging.info(
+                f"Polish skipped: {len(text.split())} words < {min_words} (C2)"
+            )
             return text
         if not self.api_key:
             if not self._warned_no_key:

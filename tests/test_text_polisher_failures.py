@@ -112,5 +112,30 @@ class PolishFailureTests(unittest.TestCase):
         self.assertIn("429", TextPolisher._reason_from_status(429, "rate limited"))
 
 
+class PolishMinWordsSkipTests(unittest.TestCase):
+    """C2: short clips skip the LLM call entirely (no latency, no cost)."""
+
+    def test_short_text_skips_api(self):
+        post = MagicMock(return_value=FakeResponse(200))
+        p = _polisher_with_post(post)
+        text = "привет как дела друг"  # 4 words, >= _MIN_CHARS
+        out = p.polish(text, min_words=8)
+        self.assertEqual(out, text)      # returned unchanged
+        post.assert_not_called()         # no API call made
+
+    def test_long_text_still_polished(self):
+        post = MagicMock(return_value=FakeResponse(200))
+        p = _polisher_with_post(post)
+        out = p.polish(_LONG_INPUT, min_words=8)
+        self.assertEqual(out, "очищенный текст")
+        post.assert_called_once()
+
+    def test_min_words_zero_disables_skip(self):
+        post = MagicMock(return_value=FakeResponse(200))
+        p = _polisher_with_post(post)
+        p.polish("привет как дела друг", min_words=0)
+        post.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
