@@ -69,6 +69,12 @@ class ElevenLabsClient:
         self.last_language_code: Optional[str] = None  # language scribe detected last
         self.max_retries = _MAX_RETRIES
         self.timeout = _TIMEOUT
+        # STT quality knobs (scribe_v2). no_verbatim removes fillers/false-starts
+        # at the STT side for free (B1); keyterms biases recognition toward a
+        # word list (B2, +20% cost when used). Both default off here; the app
+        # sets them from settings + keyterms.json before each transcription.
+        self.no_verbatim: bool = False
+        self.keyterms: list = []
         # Cached snapshot of /v1/user/subscription. The endpoint changes only
         # when something is billed, so 5 min is plenty fresh for the UI.
         self._subscription_cache: Optional[dict] = None
@@ -149,10 +155,21 @@ class ElevenLabsClient:
         # API-compatible (same multipart form), better WER (2.3%), RU/UK both
         # tier "Excellent". tag_audio_events still defaults to true in v2, so we
         # keep sending false to suppress "(laughs)"/"(тишина)" non-speech tags.
-        data = {"model_id": "scribe_v2", "tag_audio_events": "false"}
+        data = {
+            "model_id": "scribe_v2",
+            "tag_audio_events": "false",
+            # B1: scribe_v2-only. Removes filler words / false starts / non-speech
+            # at the STT side — free, zero added latency (replaces much of polish).
+            "no_verbatim": "true" if self.no_verbatim else "false",
+        }
         # Only pin the language if specified (otherwise scribe_v2 auto-detects).
         if language:
             data["language_code"] = language
+        # B2: bias recognition toward a keyterm list (names, brands, tech terms).
+        # httpx sends a list value as repeated multipart fields — the encoding
+        # ElevenLabs expects for array form params. Empty list = not sent.
+        if self.keyterms:
+            data["keyterms"] = list(self.keyterms)
 
         last_error: Optional[TranscriptionError] = None
 

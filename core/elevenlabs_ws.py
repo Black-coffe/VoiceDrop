@@ -24,6 +24,12 @@ import json
 import logging
 import time
 from typing import Callable, Optional
+from urllib.parse import urlencode
+
+# Realtime keyterm limits (ElevenLabs): max 50 terms, 20 chars each (vs batch
+# 1000×50). We clamp defensively so a too-large list can't be rejected.
+_RT_KEYTERMS_MAX = 50
+_RT_KEYTERM_MAXLEN = 20
 
 import websockets
 from websockets.exceptions import (
@@ -126,6 +132,8 @@ class RealtimeTranscriber:
         sample_rate: int,
         on_partial: Optional[Callable[[str], None]] = None,
         language: Optional[str] = None,
+        no_verbatim: bool = False,
+        keyterms: Optional[list] = None,
     ) -> str:
         """Open WS, drain ``chunk_queue``, return the final committed text.
 
@@ -142,10 +150,20 @@ class RealtimeTranscriber:
             )
 
         headers = {"xi-api-key": self.api_key}
-        # Auto-detect when no language pinned (parity with batch path).
-        url = WS_URL
+        # Build the connection query string. language_code auto-detects when
+        # absent (parity with batch). no_verbatim (B1) strips fillers server-side;
+        # keyterms (B2) bias recognition — passed as repeated query params, each
+        # clamped to the realtime limits so an over-long list can't be rejected.
+        params: list = []
         if language:
-            url = f"{WS_URL}?language_code={language}"
+            params.append(("language_code", language))
+        if no_verbatim:
+            params.append(("no_verbatim", "true"))
+        for kt in (keyterms or [])[:_RT_KEYTERMS_MAX]:
+            term = str(kt).strip()[:_RT_KEYTERM_MAXLEN].strip()
+            if term:
+                params.append(("keyterms", term))
+        url = f"{WS_URL}?{urlencode(params)}" if params else WS_URL
 
         try:
             ws_ctx = websockets.connect(

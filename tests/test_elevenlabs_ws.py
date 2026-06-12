@@ -297,5 +297,54 @@ class RealtimeTranscriberTests(unittest.TestCase):
         self.assertTrue(ctx.exception.retryable)
 
 
+class RealtimeQueryParamTests(unittest.TestCase):
+    """B1 no_verbatim + B2 keyterms are encoded into the WS connection URL."""
+
+    def setUp(self):
+        self.rt = RealtimeTranscriber(api_key="test-key")
+
+    def _capture_url(self, **stream_kwargs):
+        events = [
+            {"message_type": "session_started"},
+            {"message_type": "committed_transcript", "text": "ok"},
+        ]
+        ws = FakeWebSocket(events)
+        captured = {}
+
+        def fake_connect(*a, **kw):
+            captured["url"] = a[0] if a else kw.get("uri") or kw.get("url")
+            return fake_connect_factory(ws)()
+
+        async def scenario():
+            q = asyncio.Queue()
+            await q.put(b"\x00" * 32)
+            await q.put(END_OF_STREAM)
+            with patch("core.elevenlabs_ws._TAIL_IDLE_SEC", 0.05), \
+                 patch("core.elevenlabs_ws.websockets.connect", fake_connect):
+                await self.rt.transcribe_stream(q, sample_rate=16000, **stream_kwargs)
+
+        run(scenario())
+        return captured["url"]
+
+    def test_no_params_plain_url(self):
+        url = self._capture_url()
+        self.assertNotIn("?", url)
+
+    def test_no_verbatim_in_query(self):
+        url = self._capture_url(no_verbatim=True)
+        self.assertIn("no_verbatim=true", url)
+
+    def test_keyterms_repeated_params_and_clamped(self):
+        url = self._capture_url(
+            language="ru",
+            keyterms=["VoiceDrop", "x" * 40],  # second term exceeds 20-char cap
+        )
+        self.assertIn("language_code=ru", url)
+        self.assertEqual(url.count("keyterms="), 2)
+        self.assertIn("keyterms=VoiceDrop", url)
+        # The over-long term is truncated to 20 chars in the URL.
+        self.assertIn("keyterms=" + "x" * 20 + "&", url + "&")
+
+
 if __name__ == "__main__":
     unittest.main()

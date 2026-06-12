@@ -127,6 +127,7 @@ from core.elevenlabs_ws import (
     RealtimeTranscriber,
 )
 from core.hotkey_manager import HotkeyManager
+from core.keyterms import KeyTerms
 from core.pending_queue import PendingQueue
 from core.profiles import ProfileManager
 from core.text_replacer import TextReplacer
@@ -173,6 +174,7 @@ class VoiceDropApp:
         self.text_polisher.on_repeated_failure = self._on_polish_repeated_failure
         self.text_polisher.on_recovered = self._on_polish_recovered
         self.voice_commands = VoiceCommands()
+        self.key_terms = KeyTerms()  # B2: hot-reloaded keyterms.json (opt-in)
         self.profiles = ProfileManager()
         self.usage = UsageTracker()
         self.realtime_transcriber = RealtimeTranscriber(ELEVENLABS_API_KEY)
@@ -317,6 +319,8 @@ class VoiceDropApp:
             sample_rate=16000,
             on_partial=on_partial,
             language=language,
+            no_verbatim=self._get_no_verbatim(),       # B1
+            keyterms=self._get_keyterms(realtime=True),  # B2
         )
 
     def _rt_enqueue_chunk(self, chunk: bytes):
@@ -608,6 +612,8 @@ class VoiceDropApp:
             settings = load_settings()
             language = settings.get('language_code', None)
 
+            # Apply current no_verbatim / keyterms (B1/B2) before the request.
+            self._refresh_batch_stt_options()
             text = self.elevenlabs_client.transcribe(audio_data, language=language)
 
             elapsed = time.time() - start_time
@@ -868,6 +874,7 @@ class VoiceDropApp:
             return
         if items:
             logging.info(f"Pending queue: {len(items)} item(s), attempting resend...")
+            self._refresh_batch_stt_options()  # B1/B2 for the resend requests
         for item in items:
             try:
                 audio = self.pending_queue.read_audio(item)
@@ -1050,6 +1057,29 @@ class VoiceDropApp:
             read_timeout=s.get('request_timeout_sec'),
         )
 
+    # --- STT quality options (B1 no_verbatim / B2 keyterms) ------------------
+
+    def _get_no_verbatim(self) -> bool:
+        """Whether to ask Scribe to drop fillers/false-starts (B1, default on)."""
+        return bool(load_settings().get('stt_no_verbatim', True))
+
+    def _get_keyterms(self, realtime: bool) -> list:
+        """Keyterm biasing list (B2), or [] when disabled. Hot-reloads the file.
+
+        Realtime caps at 50×20, batch at 1000×50 (ElevenLabs limits)."""
+        if not bool(load_settings().get('keyterms_enabled', False)):
+            return []
+        if realtime:
+            return self.key_terms.get(max_terms=50, max_len=20)
+        return self.key_terms.get(max_terms=1000, max_len=50)
+
+    def _refresh_batch_stt_options(self):
+        """Push current no_verbatim + keyterms onto the batch client. Called
+        before each batch transcription so settings.json / keyterms.json edits
+        take effect on the next clip without a restart."""
+        self.elevenlabs_client.no_verbatim = self._get_no_verbatim()
+        self.elevenlabs_client.keyterms = self._get_keyterms(realtime=False)
+
     def _get_polish_min_words(self) -> int:
         """Skip polish for clips shorter than this many words (C2, default 8)."""
         try:
@@ -1170,6 +1200,7 @@ class VoiceDropApp:
         names = {'ru': 'RU', 'uk': 'UK', 'en': 'EN'}
         try:
             logging.info(f"Re-transcribing last recording, forced language={language}")
+            self._refresh_batch_stt_options()  # B1/B2
             text = self.elevenlabs_client.transcribe(audio, language=language)
             text = (text or "").strip()
             if not text:

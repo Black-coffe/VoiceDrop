@@ -58,6 +58,34 @@ class TranscribeModelTests(unittest.TestCase):
         self.assertEqual(kwargs["data"]["tag_audio_events"], "false")
 
 
+class TranscribeOptionsTests(unittest.TestCase):
+    """B1 no_verbatim + B2 keyterms reach the multipart form correctly."""
+
+    def test_no_verbatim_false_by_default(self):
+        ok = FakeResponse(200, payload={"text": "x"})
+        client, http = _client_returning(ok)
+        client.transcribe(b"wav")
+        _, kwargs = http.post.call_args
+        self.assertEqual(kwargs["data"]["no_verbatim"], "false")
+        self.assertNotIn("keyterms", kwargs["data"])
+
+    def test_no_verbatim_true_sent(self):
+        ok = FakeResponse(200, payload={"text": "x"})
+        client, http = _client_returning(ok)
+        client.no_verbatim = True
+        client.transcribe(b"wav")
+        _, kwargs = http.post.call_args
+        self.assertEqual(kwargs["data"]["no_verbatim"], "true")
+
+    def test_keyterms_sent_as_list_when_set(self):
+        ok = FakeResponse(200, payload={"text": "x"})
+        client, http = _client_returning(ok)
+        client.keyterms = ["VoiceDrop", "Scribe"]
+        client.transcribe(b"wav")
+        _, kwargs = http.post.call_args
+        self.assertEqual(kwargs["data"]["keyterms"], ["VoiceDrop", "Scribe"])
+
+
 class TranscribeErrorClassificationTests(unittest.TestCase):
     def test_400_audio_too_short_is_not_retryable(self):
         resp = FakeResponse(
