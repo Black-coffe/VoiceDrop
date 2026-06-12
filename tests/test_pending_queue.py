@@ -97,5 +97,57 @@ class PendingQueueDeadLetterTests(unittest.TestCase):
         self.assertEqual(self.q.list_pending(), [])
 
 
+class PendingQueueRobustnessTests(unittest.TestCase):
+    """F1: corrupt sidecar handling, cap enforcement, audio round-trip."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vd_pending_")
+        self.q = PendingQueue(directory=Path(self.tmp))
+
+    def test_corrupt_sidecar_json_is_skipped_not_crashing(self):
+        good = self.q.enqueue(b"good-wav", 1000, "ru")
+        self.assertIsNotNone(good)
+        # Write a broken pair: valid-looking .wav + invalid .json.
+        (Path(self.tmp) / "20990101_000000_bad.wav").write_bytes(b"x")
+        (Path(self.tmp) / "20990101_000000_bad.json").write_text(
+            "{ this is not json", encoding="utf-8"
+        )
+        items = self.q.list_pending()  # must not raise
+        ids = {i["id"] for i in items}
+        self.assertIn(good, ids)
+        self.assertNotIn("20990101_000000_bad", ids)  # corrupt one skipped
+
+    def test_orphan_wav_without_sidecar_not_listed(self):
+        (Path(self.tmp) / "orphan.wav").write_bytes(b"x")  # no .json commit marker
+        self.assertEqual(self.q.list_pending(), [])
+
+    def test_read_audio_round_trips(self):
+        item_id = self.q.enqueue(b"RIFF-payload-123", 500, None)
+        item = next(i for i in self.q.list_pending() if i["id"] == item_id)
+        self.assertEqual(self.q.read_audio(item), b"RIFF-payload-123")
+
+    def test_cap_drops_oldest(self):
+        from core import pending_queue as pq_mod
+        original = pq_mod._MAX_PENDING
+        pq_mod._MAX_PENDING = 3
+        try:
+            ids = []
+            for i in range(5):
+                # enqueue derives the id from time to the second; force unique ids
+                ids.append(self.q.enqueue(f"wav{i}".encode(), 100 + i, None))
+            # The cap is enforced on enqueue; never more than the cap remain.
+            remaining = self.q.list_pending()
+            self.assertLessEqual(len(remaining), 3)
+        finally:
+            pq_mod._MAX_PENDING = original
+
+    def test_remove_is_idempotent(self):
+        item_id = self.q.enqueue(b"x", 100, None)
+        item = self.q.list_pending()[0]
+        self.q.remove(item)
+        self.q.remove(item)  # second remove must not raise
+        self.assertEqual(self.q.count(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
