@@ -10,6 +10,7 @@ import threading
 import time
 import winsound
 import logging
+from logging.handlers import RotatingFileHandler
 import atexit
 import signal
 from typing import Optional
@@ -26,11 +27,15 @@ def get_app_dir():
 APP_DIR = get_app_dir()
 LOG_FILE = os.path.join(APP_DIR, 'voicedrop.log')
 CRASH_LOG_FILE = os.path.join(APP_DIR, 'voicedrop_crash.log')
+# RotatingFileHandler so voicedrop.log can't grow unbounded (it had reached
+# 16 MB before this). 5 files × 2 MB = ~10 MB ceiling of recent history.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        RotatingFileHandler(
+            LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=5, encoding='utf-8'
+        ),
         logging.StreamHandler(sys.stdout)
     ]
 )
