@@ -29,6 +29,12 @@ _BOTTOM_MARGIN = 12   # gap above the taskbar / work-area bottom
 # Coalesce the rapid realtime partials into at most one overlay update per this
 # many ms — partials can arrive faster than the eye (or Tk) wants to repaint.
 _SUBTITLE_DEBOUNCE_MS = 150
+# Overlay animation frame interval (ms). 80 ms ≈ 12.5 FPS — smooth enough for
+# the waveform/timer while cutting per-frame work vs the old 50 ms / 20 FPS.
+# The old rate, combined with delete+recreate of ~43 canvas items per frame,
+# leaked Windows USER objects until the process hit the ~10k ceiling
+# (WinError 1158 → tray icon stuck, system freeze). See _draw_wave.
+_ANIM_INTERVAL_MS = 80
 
 
 class RecordingOverlay:
@@ -56,6 +62,13 @@ class RecordingOverlay:
         self._window_height = _BASE_H
         self._window_width = 280
         self._cur_height = _BASE_H  # tracks current geometry height
+
+        # Persistent waveform canvas items — created ONCE in _create_window and
+        # only updated each frame (coords/itemconfig), never delete+recreate.
+        # Recreating them every frame was the WinError 1158 USER-handle leak.
+        self._wave_bars: list = []
+        self._center_line = None
+        self._peak_lines: tuple = ()
 
         # Live subtitles (G1)
         self._subtitle_label: Optional[tk.Label] = None
@@ -136,6 +149,31 @@ class RecordingOverlay:
             highlightthickness=0
         )
         self._canvas.pack()
+
+        # Pre-create the waveform items ONCE — _draw_wave only updates their
+        # coords/colour each frame. (Delete+recreate of all of these every
+        # frame at 20 FPS was leaking USER handles → WinError 1158.)
+        center_y = self._wave_height
+        bar_width = self._wave_width / self._wave_points
+        self._wave_bars = []
+        for i in range(self._wave_points):
+            x = i * bar_width
+            bar = self._canvas.create_rectangle(
+                x + 1, center_y - 3, x + bar_width - 1, center_y + 3,
+                fill='#2d8a7e', outline='',
+            )
+            self._wave_bars.append(bar)
+        self._center_line = self._canvas.create_line(
+            0, center_y, self._wave_width, center_y, fill='#3d5a80', width=1,
+        )
+        self._peak_lines = (
+            self._canvas.create_line(
+                0, center_y, self._wave_width, center_y, fill='#7fe0d6', width=1,
+            ),
+            self._canvas.create_line(
+                0, center_y, self._wave_width, center_y, fill='#7fe0d6', width=1,
+            ),
+        )
 
         # Live-subtitle strip (G1) — hidden until realtime partials arrive.
         # wraplength keeps it to ~2 lines within the overlay width.
@@ -220,11 +258,16 @@ class RecordingOverlay:
         return level if level >= prev_peak else max(level, prev_peak * decay)
 
     def _draw_wave(self):
-        """Draw audio waveform based on real audio levels"""
-        if not self._canvas or not self._is_visible:
-            return
+        """Update the audio waveform from real audio levels.
 
-        self._canvas.delete('wave')
+        Reuses the persistent canvas items (created once in _create_window) —
+        only their coords/colour change. We never delete+recreate items here:
+        doing that ~43×/frame at 20 FPS leaked Windows USER objects until the
+        process hit the ~10k ceiling and the whole window manager started
+        failing (WinError 1158) — stuck tray icon, system freeze.
+        """
+        if not self._canvas or not self._is_visible or not self._wave_bars:
+            return
 
         # Get current audio level
         current_level = 0.0
@@ -242,51 +285,31 @@ class RecordingOverlay:
         self._peak = self._decay_peak(self._peak, current_level)
 
         center_y = self._wave_height
-
-        # Draw bars visualization (more responsive to audio)
         bar_width = self._wave_width / self._wave_points
-        for i, level in enumerate(self._level_history):
-            x = i * bar_width
-            # Add some minimum height and animate
-            height = max(3, level * self._wave_height * 1.5)
 
-            # Color based on level
+        # Update bars (responsive to audio) — move + recolour, don't recreate.
+        for i, bar in enumerate(self._wave_bars):
+            level = self._level_history[i] if i < len(self._level_history) else 0.0
+            height = max(3, level * self._wave_height * 1.5)
             if level > 0.5:
                 color = '#4ecdc4'  # Bright teal for loud
             elif level > 0.2:
                 color = '#45b7aa'  # Medium teal
             else:
                 color = '#2d8a7e'  # Dim teal for quiet
-
-            # Draw bar (centered)
-            self._canvas.create_rectangle(
-                x + 1,
-                center_y - height,
-                x + bar_width - 1,
-                center_y + height,
-                fill=color,
-                outline='',
-                tags='wave'
+            x = i * bar_width
+            self._canvas.coords(
+                bar, x + 1, center_y - height, x + bar_width - 1, center_y + height
             )
+            self._canvas.itemconfig(bar, fill=color)
 
-        # Draw center line
-        self._canvas.create_line(
-            0, center_y, self._wave_width, center_y,
-            fill='#3d5a80',
-            width=1,
-            tags='wave'
-        )
-
-        # Peak-hold marker (G2): a faint cap line at the held peak amplitude,
+        # Peak-hold markers (G2): faint cap lines at the held peak amplitude,
         # mirrored above/below centre, so brief loud moments stay visible.
         peak_h = max(3, self._peak * self._wave_height * 1.5)
         peak_h = min(peak_h, self._wave_height)  # keep within the canvas
-        for sign in (-1, 1):
+        for line, sign in zip(self._peak_lines, (-1, 1)):
             yy = center_y + sign * peak_h
-            self._canvas.create_line(
-                0, yy, self._wave_width, yy,
-                fill='#7fe0d6', width=1, tags='wave',
-            )
+            self._canvas.coords(line, 0, yy, self._wave_width, yy)
 
     def _update_timer(self):
         """Update the timer display"""
@@ -319,7 +342,7 @@ class RecordingOverlay:
             self._dot_canvas.coords(self._dot, cx - r, cy - r, cx + r, cy + r)
 
         if self._window:
-            self._animation_id = self._window.after(50, self._animate)  # 20 FPS
+            self._animation_id = self._window.after(_ANIM_INTERVAL_MS, self._animate)
 
     def show(self, parent: tk.Tk):
         """Show the overlay"""
@@ -344,6 +367,15 @@ class RecordingOverlay:
         if self._window:
             self._window.deiconify()
             self._window.lift()
+            # Cancel any still-pending animation tick so a fast re-show can't
+            # leave two _animate loops running at once (they'd double the
+            # per-frame redraw rate).
+            if self._animation_id:
+                try:
+                    self._window.after_cancel(self._animation_id)
+                except Exception:
+                    pass
+                self._animation_id = None
             self._animate()
 
     def _reset_subtitle(self):
