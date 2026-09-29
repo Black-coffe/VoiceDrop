@@ -4,7 +4,7 @@
 Push-to-talk: зажал клавишу — говоришь, отпустил — текст распознаётся, очищается и вставляется в активное окно.
 
 - **Захват микрофона** по горячей клавише (push-to-talk), резолв устройства по имени.
-- **Распознавание** через онлайн ElevenLabs Speech-to-Text (`scribe_v1`).
+- **Распознавание** через онлайн ElevenLabs Speech-to-Text (`scribe_v2`, батч или realtime по WebSocket).
 - **Постобработка текста:** LLM-полировка (Claude Haiku), словарь терминов, голосовые команды форматирования, профили Текст/Код.
 - **Авто-вставка** в активное окно (буфер / в окно / в окно + Enter).
 - **Глушение** других аудио-сессий на время записи (pycaw) с редактируемым белым списком.
@@ -14,6 +14,8 @@ Push-to-talk: зажал клавишу — говоришь, отпустил �
 
 **Стек:** Python 3.13 · httpx · sounddevice/soundfile · pynput · pyperclip · pystray/Pillow · customtkinter · apscheduler · pywin32 · pycaw · psutil · python-dotenv.
 Платформа: **Windows 10/11** (хоткеи, вставка, глушение, автозапуск — Windows-специфичны).
+
+> **macOS:** официальной мак-версии нет. План и готовые промпты, чтобы портировать VoiceDrop на MacBook с локальной бесплатной моделью Whisper через Claude Code, — в [`docs/macos-port/`](docs/macos-port/README.md).
 
 ---
 
@@ -171,3 +173,7 @@ main.py · config.py · VoiceDrop.spec
 
 ## Требования
 Windows 10/11 · микрофон · интернет · `ELEVENLABS_API_KEY` в `.env` (обязательно); `ANTHROPIC_API_KEY` — для LLM-полировки (опционально).
+
+## Лицензия
+
+[Apache License 2.0](LICENSE).
