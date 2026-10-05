@@ -8,6 +8,7 @@ already-unmuted sessions untouched.
 pycaw is mocked — no real Windows audio sessions are touched.
 """
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -109,6 +110,55 @@ class MuteUnmuteTests(unittest.TestCase):
             self.assertTrue(game.volume._muted)
             m.unmute_all()
         self.assertFalse(game.volume._muted)     # restored to original (unmuted)
+        self.assertFalse(m.is_muted)
+
+
+class ComThreadTests(unittest.TestCase):
+    """All pycaw/COM work must run on ONE long-lived thread, whatever thread
+    the caller is on — pointers released from other threads/apartments
+    crashed the app with 0xc0000005 (2026-10-05)."""
+
+    def test_calls_from_many_threads_run_on_one_com_thread(self):
+        seen = []
+
+        def sessions():
+            seen.append(threading.current_thread())
+            return [FakeSession(100, "game.exe")]
+
+        m = _muter_with_whitelist(set())
+        with patch("core.audio_muter.AudioUtilities.GetAllSessions",
+                   side_effect=sessions):
+            m.force_unmute_all()                      # from the test thread
+            for fn in (m.mute_all, m.unmute_all):     # from short-lived threads
+                t = threading.Thread(target=fn)
+                t.start()
+                t.join()
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(len(set(seen)), 1)
+        self.assertEqual(seen[0].name, "audio-muter-com")
+        self.assertIsNot(seen[0], threading.current_thread())
+
+    def test_timed_out_mute_still_lands_before_queued_unmute(self):
+        game = FakeSession(100, "game.exe", muted=False)
+        gate = threading.Event()
+        calls = []
+
+        def sessions():
+            calls.append(len(calls))
+            if len(calls) == 1:
+                gate.wait(5)  # first call (mute) is "slow"
+            return [game]
+
+        m = _muter_with_whitelist(set())
+        with patch("core.audio_muter._COM_CALL_TIMEOUT_SEC", 0.05),              patch("core.audio_muter.AudioUtilities.GetAllSessions",
+                   side_effect=sessions):
+            self.assertFalse(m.mute_all())  # timed out, still queued
+            unmute = threading.Thread(target=m.unmute_all)
+            unmute.start()
+            gate.set()
+            unmute.join(5)
+        self.assertEqual(game.volume.set_calls, [True, False])
+        self.assertFalse(game.volume._muted)
         self.assertFalse(m.is_muted)
 
 

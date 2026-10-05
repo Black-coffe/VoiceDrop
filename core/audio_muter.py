@@ -1,15 +1,29 @@
 """
 Audio Muter - Mutes system audio during recording
 Uses Windows Audio Session API via pycaw
+
+All pycaw/COM work runs on ONE long-lived thread that initializes COM once and
+owns every COM pointer it creates. Callers on any thread go through
+``_run_on_com_thread``. Before this, each press muted from a fresh short-lived
+thread with no CoInitialize of its own; its COM pointers could be released
+later from another thread / apartment, which crashed the process with an
+access violation (0xc0000005, "unknown" faulting module) — 2026-10-05.
 """
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Callable, Dict, List, Optional, Tuple, Set
 import json
+import queue
 import threading
 import logging
 
 from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
 
 from config import BASE_DIR
+
+
+# How long a caller waits for the COM thread. On timeout the job still runs
+# later, in FIFO order — so a late mute can never land after the unmute that
+# was queued behind it.
+_COM_CALL_TIMEOUT_SEC = 5.0
 
 
 class AudioMuter:
@@ -41,6 +55,53 @@ class AudioMuter:
         if not self._whitelist_path.exists():
             self._seed_whitelist()
         self._load_whitelist()
+        # Dedicated COM thread (started lazily on first call).
+        self._com_jobs: "queue.Queue" = queue.Queue()
+        self._com_thread: Optional[threading.Thread] = None
+        self._com_thread_lock = threading.Lock()
+
+    # --- COM thread -----------------------------------------------------------
+    def _com_thread_main(self):
+        try:
+            import comtypes
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception as e:
+            # Keep serving jobs anyway: pycaw calls will fail and be logged
+            # by the impls, which is no worse than not muting.
+            logging.error(f"COM init failed on audio-muter thread: {e}")
+        # Never CoUninitialize: the thread lives as long as the process, so no
+        # COM pointer created here can outlive its apartment.
+        while True:
+            fn, done, box = self._com_jobs.get()
+            try:
+                box.append(fn())
+            except Exception as e:
+                logging.error(f"Audio muter job failed: {e}", exc_info=True)
+                box.append(False)
+            finally:
+                done.set()
+                # Drop our refs so nothing COM-related lingers past the job.
+                fn = done = box = None
+
+    def _run_on_com_thread(self, fn: Callable[[], bool]) -> bool:
+        if threading.current_thread() is self._com_thread:
+            return fn()
+        with self._com_thread_lock:
+            if self._com_thread is None or not self._com_thread.is_alive():
+                self._com_thread = threading.Thread(
+                    target=self._com_thread_main, daemon=True, name="audio-muter-com"
+                )
+                self._com_thread.start()
+        done = threading.Event()
+        box: List[bool] = []
+        self._com_jobs.put((fn, done, box))
+        if not done.wait(_COM_CALL_TIMEOUT_SEC):
+            logging.warning(
+                f"Audio muter: {getattr(fn, '__name__', fn)} still running after "
+                f"{_COM_CALL_TIMEOUT_SEC:g}s; it will finish in the background"
+            )
+            return False
+        return box[0]
 
     def _seed_whitelist(self):
         payload = {
@@ -94,6 +155,9 @@ class AudioMuter:
         return process_name.lower() in self._whitelist
 
     def mute_all(self) -> bool:
+        return self._run_on_com_thread(self._mute_all_impl)
+
+    def _mute_all_impl(self) -> bool:
         """
         Mute all active audio sessions (except whitelisted apps) and save their states
 
@@ -152,6 +216,9 @@ class AudioMuter:
                 return False
 
     def unmute_all(self) -> bool:
+        return self._run_on_com_thread(self._unmute_all_impl)
+
+    def _unmute_all_impl(self) -> bool:
         """
         Restore all audio sessions to their previous states
         IMPORTANT: Unmutes ALL sessions that were muted, even if process changed
@@ -210,6 +277,9 @@ class AudioMuter:
                 return False
 
     def force_unmute_all(self) -> bool:
+        return self._run_on_com_thread(self._force_unmute_all_impl)
+
+    def _force_unmute_all_impl(self) -> bool:
         """
         Force unmute all audio sessions regardless of saved states
         Used on startup to ensure audio is working
