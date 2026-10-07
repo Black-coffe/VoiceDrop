@@ -11,6 +11,7 @@ key objects (anything exposing a .vk works, matching pynput's contract).
 """
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -142,6 +143,67 @@ class SetHotkeyTests(unittest.TestCase):
         self.assertEqual(m.hotkey_vks, {RCTRL, RSHIFT})
         self.assertEqual(m._current_vks, set())
         self.assertFalse(m._is_hotkey_active)
+
+
+class DispatchOrderTests(unittest.TestCase):
+    """D8: press/release callbacks run one at a time, in event order.
+
+    Each callback used to get its own thread, so a chord bounce (press →
+    release ~150 ms → press) ran the release while the press was still opening
+    the mic: two streams ended up open, one orphaned → native crash later.
+    """
+
+    def _drive_bounce(self, m):
+        m._on_press(FakeKey(LCTRL))
+        m._on_press(FakeKey(LSHIFT))    # press #1
+        m._on_release(FakeKey(LSHIFT))  # release while press #1 still "opening"
+        m._on_press(FakeKey(LSHIFT))    # press #2 right after
+
+    def test_press_release_press_run_in_order_without_overlap(self):
+        log = []
+        done = threading.Event()
+
+        def press():
+            log.append("press-start")
+            time.sleep(0.15)  # ~ MME stream open
+            log.append("press-end")
+            if log.count("press-end") == 2:
+                done.set()
+
+        m = HotkeyManager(press, lambda: log.append("release"),
+                          hotkey_vks={LCTRL, LSHIFT})
+        self.addCleanup(m.stop)
+        self._drive_bounce(m)
+        self.assertTrue(done.wait(2.0))
+        self.assertEqual(
+            log,
+            ["press-start", "press-end", "release", "press-start", "press-end"],
+        )
+
+    def test_listener_not_blocked_by_slow_callback(self):
+        started = threading.Event()
+        m = HotkeyManager(lambda: (started.set(), time.sleep(0.5)), lambda: None,
+                          hotkey_vks={LCTRL, LSHIFT})
+        self.addCleanup(m.stop)
+        t0 = time.monotonic()
+        m._on_press(FakeKey(LCTRL))
+        m._on_press(FakeKey(LSHIFT))
+        m._on_release(FakeKey(LSHIFT))
+        self.assertLess(time.monotonic() - t0, 0.1)
+        self.assertTrue(started.wait(1.0))
+
+    def test_failing_callback_does_not_kill_dispatcher(self):
+        def press():
+            raise RuntimeError("boom")
+
+        m, _, release = _mgr(hotkey={LCTRL, LSHIFT})
+        m.on_press_callback = press
+        self.addCleanup(m.stop)
+        with self.assertLogs(level="ERROR"):
+            m._on_press(FakeKey(LCTRL))
+            m._on_press(FakeKey(LSHIFT))
+            m._on_release(FakeKey(LSHIFT))
+            self.assertTrue(release.wait(1.0))
 
 
 if __name__ == "__main__":

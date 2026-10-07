@@ -59,6 +59,9 @@ class AudioRecorder:
         self._frames: list[np.ndarray] = []
         self._lock = threading.Lock()
         self._stream: Optional[sd.InputStream] = None
+        # Serializes the whole open (incl. A4 retries) against stop, so a stop
+        # can never miss a stream that is still opening and leave it running.
+        self._stream_lock = threading.Lock()
         self._start_time: float = 0
         # The mic is identified BY NAME (Windows device indices are unstable).
         # _device_id is only a legacy hint used when no name is configured.
@@ -178,6 +181,35 @@ class AudioRecorder:
         the UI can show "Подключаю микрофон…". We do NOT rebuild PortAudio's
         device cache here — see _OPEN_MAX_ATTEMPTS note.
         """
+        with self._stream_lock:
+            self._close_orphan_stream()
+            self._open_stream(on_retry)
+
+    def _close_orphan_stream(self):
+        """Close a stream left open by a start without a matching stop (D8).
+
+        Overwriting self._stream used to orphan a live PortAudio stream: it
+        kept feeding _frames (clips captured twice), and since sounddevice has
+        no __del__, GC later freed its cffi callback while PortAudio still
+        called it → 0xc0000005 crash with no traceback.
+        """
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            logging.warning(
+                "Previous audio stream was still open at start — closing it "
+                "(orphan guard)"
+            )
+            self._close_quietly(stream)
+
+    @staticmethod
+    def _close_quietly(stream):
+        # Pa_CloseStream aborts an active stream first, so the callback stops.
+        try:
+            stream.close()
+        except Exception as e:
+            logging.warning(f"Closing audio stream failed: {e}")
+
+    def _open_stream(self, on_retry: Optional[Callable[[int, int], None]]):
         last_err: Optional[Exception] = None
         for attempt in range(_OPEN_MAX_ATTEMPTS):
             if attempt > 0:
@@ -220,8 +252,9 @@ class AudioRecorder:
             with self._level_lock:
                 self._current_level = 0.0
 
+            stream = None
             try:
-                self._stream = sd.InputStream(
+                stream = sd.InputStream(
                     samplerate=capture_sr,
                     channels=self.channels,
                     dtype=np.float32,
@@ -229,7 +262,8 @@ class AudioRecorder:
                     blocksize=1024,
                     device=device_index
                 )
-                self._stream.start()
+                stream.start()
+                self._stream = stream
                 if attempt == 0:
                     logging.info(f"Recording at native {capture_sr} Hz")
                 else:
@@ -242,7 +276,8 @@ class AudioRecorder:
                 # Roll back so a failed open can't wedge the recording state.
                 with self._lock:
                     self.is_recording = False
-                self._stream = None
+                if stream is not None:  # opened but start() failed — don't leak it
+                    self._close_quietly(stream)
                 last_err = e
                 is_9999 = "-9999" in str(e) or "out of range" in str(e).lower()
                 logging.warning(
@@ -258,13 +293,17 @@ class AudioRecorder:
 
     def stop_recording(self) -> tuple[bytes, int]:
         """Stop recording and return audio data as WAV bytes and duration in ms"""
-        self.is_recording = False
-        duration_ms = int((time.time() - self._start_time) * 1000)
+        # Waits for an in-flight open to finish, then closes THAT stream.
+        with self._stream_lock:
+            self.is_recording = False
+            duration_ms = int((time.time() - self._start_time) * 1000)
 
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+            stream, self._stream = self._stream, None
+            if stream is not None:
+                try:
+                    stream.stop()
+                finally:
+                    stream.close()
 
         with self._lock:
             if not self._frames:

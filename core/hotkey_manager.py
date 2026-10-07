@@ -2,6 +2,8 @@
 Hotkey Manager - Global hotkey handling for recording
 Uses virtual key codes for language-independent operation
 """
+import logging
+import queue
 import threading
 from typing import Callable, Optional, Set, List
 
@@ -55,6 +57,44 @@ class HotkeyManager:
         self._modifier_latched = False  # was a modifier key held during this activation
         self._listener: Optional[keyboard.Listener] = None
         self._lock = threading.Lock()
+
+        # Press/release callbacks run IN ORDER on one dispatch thread (D8).
+        # They used to get a fresh thread each, so a chord bounce (press →
+        # release ~150 ms → press) let the release run while the press was
+        # still opening the mic: two InputStreams ended up open, one orphaned,
+        # and the next GC freed its callback under PortAudio → 0xc0000005.
+        self._dispatch_queue: Optional[queue.Queue] = None
+        self._dispatch_thread: Optional[threading.Thread] = None
+
+    def _dispatch(self, callback: Callable[[], None]):
+        """Queue a callback for the dispatch thread (started lazily).
+
+        Must be called with self._lock held. The listener never blocks, and
+        callbacks never overlap: a release waits until its press is done.
+        """
+        if self._dispatch_thread is None:
+            self._dispatch_queue = queue.Queue()
+            self._dispatch_thread = threading.Thread(
+                target=self._dispatch_loop,
+                args=(self._dispatch_queue,),
+                daemon=True,
+                name="hotkey-dispatch",
+            )
+            self._dispatch_thread.start()
+        self._dispatch_queue.put(callback)
+
+    @staticmethod
+    def _dispatch_loop(q: queue.Queue):
+        while True:
+            callback = q.get()
+            if callback is None:  # stop() sentinel
+                return
+            try:
+                callback()
+            except Exception as e:
+                # One failed callback must not kill the dispatcher — every
+                # later hotkey press would be silently dropped.
+                logging.error(f"Hotkey callback failed: {e}", exc_info=True)
 
     def _get_vk_from_key(self, key) -> Optional[int]:
         """Extract virtual key code from pynput key"""
@@ -137,8 +177,8 @@ class HotkeyManager:
                 self._is_hotkey_active = True
                 # Latch whether a "mode" modifier is already held at activation
                 self._modifier_latched = bool(self._modifier_vks & self._current_vks)
-                # Run callback in separate thread to not block listener
-                threading.Thread(target=self.on_press_callback, daemon=True).start()
+                # Off the listener thread, but ordered after any earlier release
+                self._dispatch(self.on_press_callback)
             elif self._is_hotkey_active and vk in self._modifier_vks:
                 # Modifier added mid-recording -> latch it for this clip
                 self._modifier_latched = True
@@ -162,8 +202,8 @@ class HotkeyManager:
 
                 if released_in_hotkey:
                     self._is_hotkey_active = False
-                    # Run callback in separate thread
-                    threading.Thread(target=self.on_release_callback, daemon=True).start()
+                    # Runs only after the press callback has finished
+                    self._dispatch(self.on_release_callback)
 
             # Remove key from current keys
             self._current_vks.discard(vk)
@@ -181,6 +221,11 @@ class HotkeyManager:
         if self._listener:
             self._listener.stop()
             self._listener = None
+        with self._lock:
+            if self._dispatch_thread is not None:
+                self._dispatch_queue.put(None)  # finish queued callbacks, then exit
+                self._dispatch_thread = None
+                self._dispatch_queue = None
 
     def is_running(self) -> bool:
         """Check if listener is running"""

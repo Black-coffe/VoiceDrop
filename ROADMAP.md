@@ -238,6 +238,23 @@ destroyed» и риск потери клипа при выходе во вре�
 Сейчас mutex молча не даёт запуститься. Добавить MessageBox «VoiceDrop уже запущен»
 (или активировать tray существующей копии). Частый источник «приложение не реагирует».
 
+### D8. Тихий нативный краш от «осиротевшего» потока микрофона ✅ DONE
+**P0 · S · `core/hotkey_manager.py`, `core/audio_recorder.py`, `main.py`** — выполнено (2026-10-07).
+Симптом: VoiceDrop пропадает из трея без `voicedrop_crash.log`; в журнале Windows
+`0xc0000005`, модуль `unknown` (2026-10-05 11:07, 2026-10-07 12:59). Причина: дребезг
+аккорда хоткея (нажал → отпустил ~150 мс → нажал) — press/release шли каждый в своём
+потоке, release выполнялся, пока press ещё открывал микрофон. Итог: два `InputStream`,
+`self._stream` перезаписан, первый поток «осиротел» и продолжал писать (каждый клип
+`captured` = 2× `wall`), диктовка терялась как «Recording too short», а realtime-сессия
+висела. У sounddevice нет `__del__` → следующий GC освобождал cffi-колбэк под живым
+PortAudio → краш (рядом в логе — «Task was destroyed but it is pending!»).
+Фикс: колбэки хоткея выполняются строго по порядку в одном потоке `hotkey-dispatch`;
+`start_recording`/`stop_recording` сериализованы `_stream_lock`, перед открытием старый
+поток закрывается (warning «orphan guard»), неудачный `start()` не теряет открытый поток;
+новое нажатие отменяет зависшую realtime-сессию. Тесты: `test_hotkey_manager`
+(DispatchOrderTests), `test_audio_recorder_stream_lifecycle`. Прошлый фикс `006cdcd`
+(COM в одном потоке) эту причину не закрывал.
+
 ---
 
 ## E. Рефакторинг и качество кода

@@ -434,6 +434,14 @@ class VoiceDropApp:
             if self._get_stt_mode() == "realtime":
                 try:
                     self._ensure_rt_loop()
+                    # D8: a session whose release never reached it would hang
+                    # on its queue until GC destroys the pending task — cancel
+                    # it explicitly before replacing the reference.
+                    stale = self._rt_active_future
+                    if stale is not None:
+                        logging.warning("Cancelling stale realtime session from a previous press")
+                        stale.cancel()
+                        self._rt_active_future = None
                     settings = load_settings()
                     self._rt_language = settings.get("language_code", None)
                     # asyncio.Queue() can be constructed from any thread in
