@@ -48,6 +48,23 @@ _OPEN_RETRY_BACKOFF_SEC = (0.2, 0.4, 0.8, 1.2)
 # a 1024-frame block, so it fits in the PortAudio callback budget.
 _RT_TARGET_SR = 16000
 
+# How long start/stop wait for a previous open/stop that still holds the stream
+# (D8). Normal ones take <=0.2 s, so anything past this means the driver is
+# wedged: fail fast with a clear message instead of queuing up behind it.
+_STREAM_LOCK_TIMEOUT_SEC = 2.0
+
+MIC_NOT_RESPONDING_MSG = (
+    "Микрофон не отвечает. Если через несколько секунд не оживёт — "
+    "переподключите микрофон (USB) или перезапустите VoiceDrop."
+)
+
+
+class MicrophoneBusyError(RuntimeError):
+    """A previous open/stop of the mic is still stuck in the driver."""
+
+    def __init__(self):
+        super().__init__(MIC_NOT_RESPONDING_MSG)
+
 
 class AudioRecorder:
     def __init__(self):
@@ -62,6 +79,8 @@ class AudioRecorder:
         # Serializes the whole open (incl. A4 retries) against stop, so a stop
         # can never miss a stream that is still opening and leave it running.
         self._stream_lock = threading.Lock()
+        # Bumped on every successful open; lets a caller stop only ITS stream.
+        self._generation = 0
         self._start_time: float = 0
         # The mic is identified BY NAME (Windows device indices are unstable).
         # _device_id is only a legacy hint used when no name is configured.
@@ -166,7 +185,7 @@ class AudioRecorder:
             logging.warning(f"Could not query device samplerate, using fallback {SAMPLE_RATE}: {e}")
         return SAMPLE_RATE
 
-    def start_recording(self, on_retry: Optional[Callable[[int, int], None]] = None):
+    def start_recording(self, on_retry: Optional[Callable[[int, int], None]] = None) -> int:
         """Start recording audio from the configured mic (resolved BY NAME).
 
         Raises RuntimeError if a specific microphone was configured but is not
@@ -180,10 +199,17 @@ class AudioRecorder:
         ``on_retry(attempt, total)`` (if given) is called before each wait so
         the UI can show "Подключаю микрофон…". We do NOT rebuild PortAudio's
         device cache here — see _OPEN_MAX_ATTEMPTS note.
+
+        Returns this recording's generation for stop_recording(). Raises
+        MicrophoneBusyError if a previous open/stop is still stuck.
         """
-        with self._stream_lock:
+        if not self._stream_lock.acquire(timeout=_STREAM_LOCK_TIMEOUT_SEC):
+            raise MicrophoneBusyError()
+        try:
             self._close_orphan_stream()
-            self._open_stream(on_retry)
+            return self._open_stream(on_retry)
+        finally:
+            self._stream_lock.release()
 
     def _close_orphan_stream(self):
         """Close a stream left open by a start without a matching stop (D8).
@@ -209,7 +235,7 @@ class AudioRecorder:
         except Exception as e:
             logging.warning(f"Closing audio stream failed: {e}")
 
-    def _open_stream(self, on_retry: Optional[Callable[[int, int], None]]):
+    def _open_stream(self, on_retry: Optional[Callable[[int, int], None]]) -> int:
         last_err: Optional[Exception] = None
         for attempt in range(_OPEN_MAX_ATTEMPTS):
             if attempt > 0:
@@ -264,6 +290,7 @@ class AudioRecorder:
                 )
                 stream.start()
                 self._stream = stream
+                self._generation += 1
                 if attempt == 0:
                     logging.info(f"Recording at native {capture_sr} Hz")
                 else:
@@ -271,7 +298,7 @@ class AudioRecorder:
                         f"Recording at native {capture_sr} Hz "
                         f"(recovered on attempt {attempt + 1})"
                     )
-                return  # success
+                return self._generation  # success
             except Exception as e:
                 # Roll back so a failed open can't wedge the recording state.
                 with self._lock:
@@ -291,10 +318,19 @@ class AudioRecorder:
             "Не удалось открыть микрофон"
         )
 
-    def stop_recording(self) -> tuple[bytes, int]:
-        """Stop recording and return audio data as WAV bytes and duration in ms"""
+    def stop_recording(self, expected_generation: Optional[int] = None) -> tuple[bytes, int]:
+        """Stop recording and return audio data as WAV bytes and duration in ms.
+
+        With ``expected_generation`` (from start_recording) it stops only that
+        recording and leaves a newer one alone. Raises MicrophoneBusyError if
+        a previous open/stop is still stuck.
+        """
         # Waits for an in-flight open to finish, then closes THAT stream.
-        with self._stream_lock:
+        if not self._stream_lock.acquire(timeout=_STREAM_LOCK_TIMEOUT_SEC):
+            raise MicrophoneBusyError()
+        try:
+            if expected_generation is not None and expected_generation != self._generation:
+                return b"", 0  # a newer recording owns the mic — leave it alone
             self.is_recording = False
             duration_ms = int((time.time() - self._start_time) * 1000)
 
@@ -304,6 +340,8 @@ class AudioRecorder:
                     stream.stop()
                 finally:
                     stream.close()
+        finally:
+            self._stream_lock.release()
 
         with self._lock:
             if not self._frames:

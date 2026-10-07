@@ -27,6 +27,14 @@ MODIFIER_VKS = {
 # matching (so Ctrl+Shift+Space still works with either side).
 RIGHT_MODIFIER_VKS = {163, 161, 165, 92}
 
+# A callback still running after this is treated as hung (D8): the dispatcher
+# stops waiting, reports it via on_hang and moves on, so a mic wedged in the
+# driver can't silently swallow every later press. Press covers the A4 open
+# retries (~2.6 s backoff + opens) and the first rt-loop start (<=2 s);
+# release normally takes ~0.1 s.
+PRESS_HANG_TIMEOUT_SEC = 8.0
+RELEASE_HANG_TIMEOUT_SEC = 4.0
+
 
 class HotkeyManager:
     def __init__(
@@ -34,7 +42,10 @@ class HotkeyManager:
         on_press_callback: Callable[[], None],
         on_release_callback: Callable[[], None],
         hotkey_vks: Optional[Set[int]] = None,
-        modifier_vks: Optional[Set[int]] = None
+        modifier_vks: Optional[Set[int]] = None,
+        on_hang: Optional[Callable[[str], None]] = None,
+        press_timeout_sec: float = PRESS_HANG_TIMEOUT_SEC,
+        release_timeout_sec: float = RELEASE_HANG_TIMEOUT_SEC,
     ):
         """
         Initialize hotkey manager
@@ -46,6 +57,8 @@ class HotkeyManager:
             modifier_vks: Extra "mode" keys; if any are held during the active
                 window, modifier_was_held() returns True (e.g. Right Shift =
                 dictate this clip in code mode). Not part of the trigger itself.
+            on_hang: Called with the callback's name when a press/release
+                callback outlives its timeout and the dispatcher moves on.
         """
         self.on_press_callback = on_press_callback
         self.on_release_callback = on_release_callback
@@ -65,12 +78,16 @@ class HotkeyManager:
         # and the next GC freed its callback under PortAudio → 0xc0000005.
         self._dispatch_queue: Optional[queue.Queue] = None
         self._dispatch_thread: Optional[threading.Thread] = None
+        self.on_hang = on_hang
+        self._press_timeout_sec = press_timeout_sec
+        self._release_timeout_sec = release_timeout_sec
 
-    def _dispatch(self, callback: Callable[[], None]):
+    def _dispatch(self, callback: Callable[[], None], timeout: float):
         """Queue a callback for the dispatch thread (started lazily).
 
         Must be called with self._lock held. The listener never blocks, and
-        callbacks never overlap: a release waits until its press is done.
+        callbacks never overlap: a release waits until its press is done —
+        unless the press hangs past its timeout (see _dispatch_loop).
         """
         if self._dispatch_thread is None:
             self._dispatch_queue = queue.Queue()
@@ -81,20 +98,42 @@ class HotkeyManager:
                 name="hotkey-dispatch",
             )
             self._dispatch_thread.start()
-        self._dispatch_queue.put(callback)
+        self._dispatch_queue.put((callback, timeout))
+
+    def _dispatch_loop(self, q: queue.Queue):
+        while True:
+            item = q.get()
+            if item is None:  # stop() sentinel
+                return
+            callback, timeout = item
+            # Each callback runs on its own worker so a hung one (mic stuck in
+            # Pa_OpenStream / stop()) can't block the queue forever. Normal
+            # callbacks finish well inside the timeout, so order is unchanged.
+            worker = threading.Thread(
+                target=self._run_callback, args=(callback,),
+                daemon=True, name="hotkey-callback",
+            )
+            worker.start()
+            worker.join(timeout)
+            if worker.is_alive():
+                name = getattr(callback, "__name__", repr(callback))
+                logging.error(
+                    f"Hotkey callback {name} still running after {timeout:g} s "
+                    f"— treating it as hung and moving on"
+                )
+                if self.on_hang is not None:
+                    try:
+                        self.on_hang(name)
+                    except Exception as e:
+                        logging.error(f"on_hang failed: {e}", exc_info=True)
 
     @staticmethod
-    def _dispatch_loop(q: queue.Queue):
-        while True:
-            callback = q.get()
-            if callback is None:  # stop() sentinel
-                return
-            try:
-                callback()
-            except Exception as e:
-                # One failed callback must not kill the dispatcher — every
-                # later hotkey press would be silently dropped.
-                logging.error(f"Hotkey callback failed: {e}", exc_info=True)
+    def _run_callback(callback: Callable[[], None]):
+        try:
+            callback()
+        except Exception as e:
+            # Logged here so a failing callback never takes the dispatcher down.
+            logging.error(f"Hotkey callback failed: {e}", exc_info=True)
 
     def _get_vk_from_key(self, key) -> Optional[int]:
         """Extract virtual key code from pynput key"""
@@ -178,7 +217,7 @@ class HotkeyManager:
                 # Latch whether a "mode" modifier is already held at activation
                 self._modifier_latched = bool(self._modifier_vks & self._current_vks)
                 # Off the listener thread, but ordered after any earlier release
-                self._dispatch(self.on_press_callback)
+                self._dispatch(self.on_press_callback, self._press_timeout_sec)
             elif self._is_hotkey_active and vk in self._modifier_vks:
                 # Modifier added mid-recording -> latch it for this clip
                 self._modifier_latched = True
@@ -203,7 +242,7 @@ class HotkeyManager:
                 if released_in_hotkey:
                     self._is_hotkey_active = False
                     # Runs only after the press callback has finished
-                    self._dispatch(self.on_release_callback)
+                    self._dispatch(self.on_release_callback, self._release_timeout_sec)
 
             # Remove key from current keys
             self._current_vks.discard(vk)

@@ -206,5 +206,41 @@ class DispatchOrderTests(unittest.TestCase):
             self.assertTrue(release.wait(1.0))
 
 
+class HangTests(unittest.TestCase):
+    """D8: a hung callback (mic stuck in the driver) must not wedge the queue —
+    the dispatcher reports it via on_hang and moves on to the next event."""
+
+    def test_hung_press_is_reported_and_release_still_runs(self):
+        unblock = threading.Event()
+        release = threading.Event()
+        hangs = []
+
+        def stuck_press():
+            unblock.wait(5.0)
+
+        m = HotkeyManager(stuck_press, release.set, hotkey_vks={LCTRL, LSHIFT},
+                          on_hang=hangs.append, press_timeout_sec=0.2)
+        self.addCleanup(unblock.set)
+        self.addCleanup(m.stop)
+        with self.assertLogs(level="ERROR"):
+            m._on_press(FakeKey(LCTRL))
+            m._on_press(FakeKey(LSHIFT))
+            m._on_release(FakeKey(LSHIFT))
+            self.assertTrue(release.wait(2.0))
+        self.assertEqual(hangs, ["stuck_press"])
+
+    def test_fast_callbacks_are_not_reported_as_hung(self):
+        hangs = []
+        m, press, release = _mgr(hotkey={LCTRL, LSHIFT})
+        m.on_hang = hangs.append
+        self.addCleanup(m.stop)
+        m._on_press(FakeKey(LCTRL))
+        m._on_press(FakeKey(LSHIFT))
+        m._on_release(FakeKey(LSHIFT))
+        self.assertTrue(press.wait(1.0))
+        self.assertTrue(release.wait(1.0))
+        self.assertEqual(hangs, [])
+
+
 if __name__ == "__main__":
     unittest.main()

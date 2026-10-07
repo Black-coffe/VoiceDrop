@@ -118,7 +118,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from config import ELEVENLABS_API_KEY, HISTORY_RETENTION_HOURS, APP_VERSION
 from core import autostart
 from core.audio_muter import AudioMuter
-from core.audio_recorder import AudioRecorder
+from core.audio_recorder import AudioRecorder, MIC_NOT_RESPONDING_MSG
 from core.db_manager import DatabaseManager
 from core.elevenlabs_api import ElevenLabsClient, TranscriptionError
 from core.elevenlabs_ws import (
@@ -398,7 +398,7 @@ class VoiceDropApp:
             # on_retry surfaces "Подключаю микрофон…" in the overlay while the
             # recorder re-resolves + backs off through a USB-suspend wake (A4).
             try:
-                self.audio_recorder.start_recording(on_retry=self._on_mic_retry)
+                generation = self.audio_recorder.start_recording(on_retry=self._on_mic_retry)
             except Exception as e:
                 logging.error(f"Failed to start recording: {e}", exc_info=True)
                 with self._lock:
@@ -414,6 +414,19 @@ class VoiceDropApp:
                 if self.recording_overlay and self._root:
                     self._root.after(0, self.recording_overlay.hide)
                 winsound.Beep(300, 200)  # error cue
+                return
+
+            # D8: a stuck open can outlive the hotkey dispatcher's hang timeout,
+            # so this press's release may already have run. Don't leave the mic
+            # recording with nobody left to stop it.
+            with self._lock:
+                still_current = self._is_recording and session_id == self._record_session_id
+            if not still_current:
+                logging.warning("Microphone opened after its hotkey was released — closing it")
+                try:
+                    self.audio_recorder.stop_recording(expected_generation=generation)
+                except Exception as e:
+                    logging.error(f"Closing the late-opened microphone failed: {e}")
                 return
 
             # 2) UI feedback.
@@ -495,6 +508,17 @@ class VoiceDropApp:
         t = threading.Timer(3.0, _delayed_sweep)
         t.daemon = True
         t.start()
+
+    def _on_hotkey_hang(self, callback_name: str):
+        """HotkeyManager gave up waiting on a press/release callback (D8).
+
+        The mic is stuck in the driver; tell the user instead of silently
+        losing every dictation while the tray icon still looks alive.
+        HotkeyManager has already logged the hang with callback_name.
+        """
+        if self.tray_icon:
+            self.tray_icon.show_notification("VoiceDrop — микрофон", MIC_NOT_RESPONDING_MSG)
+        winsound.Beep(300, 200)  # error cue
 
     def _on_mic_retry(self, attempt: int, total: int):
         """Called by AudioRecorder before each mic-open retry (A4). Logs the
@@ -1446,7 +1470,8 @@ class VoiceDropApp:
             on_press_callback=self._on_hotkey_press,
             on_release_callback=self._on_hotkey_release,
             hotkey_vks=self._saved_hotkey_vks,
-            modifier_vks=self._code_modifier_vks
+            modifier_vks=self._code_modifier_vks,
+            on_hang=self._on_hotkey_hang,
         )
         self.hotkey_manager.start()
 

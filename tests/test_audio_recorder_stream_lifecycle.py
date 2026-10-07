@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.audio_recorder import AudioRecorder
+from core.audio_recorder import AudioRecorder, MicrophoneBusyError
 
 
 class StreamLifecycleTests(unittest.TestCase):
@@ -95,6 +95,37 @@ class StreamLifecycleTests(unittest.TestCase):
         stream.close.assert_called_once()
         self.assertIsNone(self.rec._stream)
 
+
+    def test_start_fails_fast_while_previous_call_is_stuck(self):
+        self.rec._stream_lock.acquire()  # a hung open/stop is holding it
+        self.addCleanup(self.rec._stream_lock.release)
+        with patch("core.audio_recorder._STREAM_LOCK_TIMEOUT_SEC", 0.05),              patch("core.audio_recorder.sd.InputStream") as InputStream:
+            with self.assertRaises(MicrophoneBusyError) as cm:
+                self.rec.start_recording()
+        InputStream.assert_not_called()
+        self.assertIn("Микрофон не отвечает", str(cm.exception))
+
+    def test_stop_fails_fast_while_previous_call_is_stuck(self):
+        self.rec._stream_lock.acquire()
+        self.addCleanup(self.rec._stream_lock.release)
+        with patch("core.audio_recorder._STREAM_LOCK_TIMEOUT_SEC", 0.05):
+            with self.assertRaises(MicrophoneBusyError):
+                self.rec.stop_recording()
+
+    def test_stale_generation_stop_leaves_newer_recording_alone(self):
+        """A late-finishing open stops only its own stream, never a newer one."""
+        first, second = MagicMock(), MagicMock()
+        with patch("core.audio_recorder.sd.InputStream", side_effect=[first, second]):
+            gen1 = self.rec.start_recording()
+            with self.assertLogs(level="WARNING"):
+                gen2 = self.rec.start_recording()
+        self.assertGreater(gen2, gen1)
+        self.assertEqual(self.rec.stop_recording(expected_generation=gen1), (b"", 0))
+        second.stop.assert_not_called()
+        self.assertTrue(self.rec.is_recording)
+        self.rec.stop_recording(expected_generation=gen2)
+        second.stop.assert_called_once()
+        self.assertFalse(self.rec.is_recording)
 
 if __name__ == "__main__":
     unittest.main()
